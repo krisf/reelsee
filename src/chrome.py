@@ -225,9 +225,8 @@ import gi  # noqa: E402
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
-gi.require_version("Pango", "1.0")
 gi.require_version("Graphene", "1.0")
-from gi.repository import Gdk, GLib, Gtk, Graphene, Pango  # noqa: E402
+from gi.repository import Gdk, GLib, Gtk, Graphene  # noqa: E402
 
 
 def _rect(x, y, w, h):
@@ -359,7 +358,7 @@ class _SeekScale(Gtk.Scale):
 
 
 class Chrome:
-    """Owns the top/bottom bars, OSD + toast labels and the ChromeState.
+    """Owns the bottom bar, OSD + toast labels and the ChromeState.
 
     `window` is the ReelseeWindow (used for GLib timers, cursor, actions).
     """
@@ -376,7 +375,14 @@ class Chrome:
         self.on_ab = on_ab
         self.on_repeat = on_repeat
         self.on_decode = on_decode
-        self._repeat_mode = "off"
+        # R9-A: the first paint shows the PERSISTED mode (icon AND dim —
+        # _update_repeat reads this seed), so a restart never flickers
+        # through "off".  Not a parallel truth: it is this widget's own
+        # display cache, and update_snapshot re-derives it from the mpv
+        # properties every frame — the seeded engine init options make
+        # the first observed value agree.  Unknown stored value → "off".
+        self._repeat_mode = repeat_mode(cfg.get("playback.loop_file"),
+                                        cfg.get("playback.loop_playlist"))
         self.state = ChromeState(float(cfg.get("ui.chrome_timeout_ms", 3000)))
         self.osd_ms = float(cfg.get("ui.osd_ms", 1200))
         self._dragging = False
@@ -507,24 +513,10 @@ class Chrome:
         self.preview.set_margin_bottom(56)
         self.preview.set_visible(False)
 
-        # ---- top bar: title + track/loop buttons ----------------------------
-        self.top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self.top.add_css_class("reelsee-chrome")
-        self.title_label = Gtk.Label(label="REELSEE")
-        self.title_label.add_css_class("reelsee-chrome")
-        self.title_label.set_ellipsize(Pango.EllipsizeMode.END)
-        self.title_label.set_hexpand(True)
-        self.title_label.set_halign(Gtk.Align.START)
-        self.btn_audio = Gtk.Button(label="audio")
-        self.btn_sub = Gtk.Button(label="subs")
-        # R5-C: the old "loop" button left the top bar — repeat now lives
-        # as an icon toggle beside the progress bar (bottom).
-        for b, act in ((self.btn_audio, "win.cycle-audio"),
-                       (self.btn_sub, "win.cycle-sub")):
-            b.add_css_class("reelsee-chrome")
-            b.set_action_name(act)
-            self.top.append(b)
-        self.top.prepend(self.title_label)
+        # R8-A: the in-video TOP MENU BAR is gone — entirely.  No bar, no
+        # filename label, no audio/subs/playlist/chapters/tracks buttons
+        # exist for ANY config value; every feature lives in the right-click
+        # context menu (ctxmenu.build) and the window title keeps the name.
 
         # ---- OSD (transient, keyboard feedback) + toast ---------------------
         self.osd = Gtk.Label(label="")
@@ -547,23 +539,14 @@ class Chrome:
         self.seek.add_controller(mc)
 
     # ------------------------------------------------------------- overlays
-    def add_top_menu(self, label: str, tooltip: str = "") -> Gtk.MenuButton:
-        """§7 T1: attach a popover launcher (playlist / chapters / tracks)
-        to the right side of the top bar.  The caller populates the button
-        via Gtk.MenuButton.set_popover()."""
-        mb = Gtk.MenuButton(label=label)
-        mb.add_css_class("reelsee-chrome")
-        if tooltip:
-            mb.set_tooltip_text(tooltip)
-        self.top.append(mb)
-        return mb
-
     def overlay_children(self):
-        """(top, preview, osd, toast, bottom) — window adds them to its overlay."""
-        self.top.set_valign(Gtk.Align.START)
+        """(preview, osd, toast, bottom) — window adds them to its overlay.
+
+        R8-A: the deleted top menu bar is NOT in this list for ANY config
+        value — the bar and every child of it simply do not exist."""
         self.bottom.set_valign(Gtk.Align.END)
         self.osd.set_valign(Gtk.Align.CENTER)
-        return (self.top, self.preview, self.osd, self.toast, self.bottom)
+        return (self.preview, self.osd, self.toast, self.bottom)
 
     # ---------------------------------------------------------------- motion
     def motion(self, x: float, y: float, width: float, height: float) -> None:
@@ -604,8 +587,7 @@ class Chrome:
 
     @property
     def bars_visible(self) -> bool:
-        """Current applied chrome visibility (R5-B: used to keep a
-        re-added top bar consistent with the live chrome state)."""
+        """Current applied chrome visibility (bottom bar + reveal mirror)."""
         return self._bars_visible
 
     # ------------------------------------------------------------ visibility
@@ -620,9 +602,7 @@ class Chrome:
         if self._menu_open:
             visible = True
         changed = visible is not self._bars_visible
-        for bar in (self.top, self.bottom):
-            if bar.get_parent() is None:
-                continue        # R5-B: ui.show_top_menu off — top not in tree
+        for bar in (self.bottom,):
             bar.set_child_visible(visible)
             bar.set_opacity(1.0 if visible else 0.0)
             # GTK overlay damage bug (P5 finding): a queue_draw() landing
@@ -829,8 +809,9 @@ class Chrome:
         # a raw "l"/"r" keypress repaints the button via this path.
         self.set_repeat(repeat_mode(snap.get("loop-file"),
                                     snap.get("loop-playlist")))
-        title = snap.get("media-title") or snap.get("filename") or "REELSEE"
-        self.title_label.set_label(str(title))
+        # R8-A: the old top-bar filename label is gone with the bar; the
+        # window title + headerbar title_widget (window._update_title) are
+        # the ONE place the filename shows.
 
     # ------------------------------------------------------------- handlers
     def _on_seek_change(self, _scale, _scroll, value) -> bool:

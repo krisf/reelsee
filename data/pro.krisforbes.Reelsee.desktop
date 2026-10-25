@@ -3,7 +3,20 @@ Type=Application
 Name=Reelsee
 GenericName=Video Player
 Comment=GTK4/libmpv video player with GPU-aware decoding
-Exec=reelsee %U
+# R10-C: window POSITIONING only exists on the X11 backend — Wayland
+# compositors reject position requests (xdg-shell has no such request), so
+# the packaged launcher pins GDK_BACKEND=x11 the way limusic's does, but
+# via ${GDK_BACKEND:-x11} so a user-set GDK_BACKEND still wins (the
+# requirement is environment-OVERRIDABLE, limusic's plain `env` is not).
+# Escaping measured, not guessed (see DSH-REPORT-R10.md §C): the double-
+# quote/desktop-escape form makes G_KEY_FILE — the loader desktop app info
+# actually uses — reject the file, so the app would VANISH from GNOME;
+# this single-quote form loads through Gio.DesktopAppInfo and expands
+# correctly through the real keyfile→shell chain.  desktop-file-validate
+# emits two cosmetic linter warnings here (' and $ inside the value);
+# accepted, unlaunchable is worse than lint.  %U stays a bare field code;
+# dev launch (./run, scripts/) is deliberately untouched.
+Exec=sh -c 'GDK_BACKEND="${GDK_BACKEND:-x11}" exec reelsee "$@"' reelsee %U
 Icon=reelsee
 Terminal=false
 Categories=AudioVideo;Player;Video;

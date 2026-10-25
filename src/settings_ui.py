@@ -172,8 +172,20 @@ BINDINGS: tuple[dict, ...] = (
          choices=("black",)),
     dict(key="ui.ontop", page="interface", kind="switch",
          label="Always on top"),
-    dict(key="ui.show_top_menu", page="interface", kind="switch",
-         label="Show menu bar"),
+    # R8-A: ui.show_top_menu row DELETED with the bar itself — the setting
+    # no longer exists; old configs carrying the key load silently and the
+    # key is simply ignored (deep_merge keeps unknown keys, nothing reads
+    # it).
+    dict(key="ui.lock_aspect", page="interface", kind="switch",
+         label="Keep window aspect on resize"),
+    # R10: the remembered geometry itself is STATE (window.json), but
+    # WHETHER to remember and how far to cascade is user policy.  Both are
+    # read live when the NEXT window opens — no restart needed.
+    dict(key="ui.remember_geometry", page="interface", kind="switch",
+         label="Remember window size and position"),
+    dict(key="ui.cascade_offset_px", page="interface", kind="scale",
+         label="New-window cascade offset (px, 0 = exactly on top)",
+         minimum=0, maximum=200, step=1, digits=0),
     dict(key="ui.title_format", page="interface", kind="entry",
          label="Window title (${media-title} placeholder)"),
     dict(key="ui.screenshot_clipboard", page="interface", kind="switch",
@@ -323,7 +335,11 @@ class SettingsWindow:
     """
 
     def __init__(self, app, cfg, on_close=None):
-        assert not validate_bindings(cfg.data), validate_bindings(cfg.data)
+        # R8-A: schema<->binding coherence is linted against DEFAULTS —
+        # cfg.data legitimately PRESERVES unknown keys (deep_merge
+        # contract, e.g. old configs carrying a deleted key); opening
+        # settings must stay a clean no-op for those, never an assert.
+        assert not validate_bindings(), validate_bindings()
         self.app = app
         self.cfg = cfg
         self.widgets: dict[str, object] = {}

@@ -20,7 +20,7 @@ STATE = os.path.join(SCRATCH, "resume-state")
 def main() -> int:
     for d in (CFG, STATE):
         os.makedirs(d, exist_ok=True)
-    for name in ("config.json", "resume.json", "ab.json"):
+    for name in ("config.json", "resume.json", "ab.json", "window.json"):
         for base in (CFG, STATE):
             p = os.path.join(base, name)
             if os.path.exists(p):

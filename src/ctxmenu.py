@@ -3,10 +3,14 @@
 ONE model, ONE truth: this module turns the live mpv snapshot into a
 ``Gio.Menu``.  It never touches mpv, GTK widgets or config.  src/window.py
 registers the ``ctx.*`` actions the model references and routes them to
-the SAME entry points the keymap and the top-menu popovers already use
-(identical ``core.command("set", ...)`` calls, identical repeat cycle via
-``chrome.repeat_props``) — so the context menu can never disagree with
-the rest of the player, and both stay dead when ui.show_top_menu is off.
+the SAME entry points the keymap and the playlist/chapters/tracks popovers
+already use (identical ``core.command("set", ...)`` calls, identical
+repeat cycle via ``chrome.repeat_props``) — so the context menu can never
+disagree with the rest of the player.
+
+R8-A: with the in-video top menu bar DELETED outright, this menu is the
+home of every feature the bar had — it is the only menu, always, for
+every config.
 
 Rules implemented here (round 6 brief §A):
   * a disabled filename header is the first section;

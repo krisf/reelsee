@@ -1,9 +1,7 @@
 # REELSEE — design document (as built)
 
-> Written before the first line of code; kept verbatim because the
-> docstrings, test names and gates cite its section numbers
-> (`PLAN §4.6`, `R-5`, `P0`…`P12`). Deviating from a rule here means
-> updating the rule *and* its gate, not just the code.
+> Written before the first line of code; kept because docstrings, test
+> names and gates cite its section numbers (`PLAN §4.6`, `R-5`, `P0`…`P12`).
 
 # PLAN.md — REELSEE: greenfield GTK4 video player (libmpv frontend, Looksee's sister app)
 Dispatch model: whole-build single-run via DeepSeek Harness (dsh alias `qwen3.8-27b` @ 127.0.0.1:8180).

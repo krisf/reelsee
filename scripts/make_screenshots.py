@@ -18,7 +18,9 @@ Shot list:
   hero        playback with the transport bar and title bar revealed
   clean       chrome retracted after the idle timeout (video only)
   settings    the Adw preferences window (engine / GPU selector)
-  menu        the right-click context menu over the video
+
+No context-menu shot: see the note in main() — GTK popups cannot be captured
+under a compositor-less Xvfb, so that image would be a fiction.
 """
 import json
 import os
@@ -96,18 +98,6 @@ def write_cfg(home: Path, overrides: dict) -> None:
     cfg_dir = home / "config" / "reelsee"
     cfg_dir.mkdir(parents=True, exist_ok=True)
     (cfg_dir / "config.json").write_text(json.dumps(overrides, indent=2))
-
-
-def press_root(x: int, y: int, button: int = 1) -> None:
-    xtest.fake_input(_D, X.MotionNotify, x=x, y=y)
-    _D.sync()
-    xtest.fake_input(_D, X.ButtonPress, button)
-    _D.sync()
-
-
-def release_root(button: int = 1) -> None:
-    xtest.fake_input(_D, X.ButtonRelease, button)
-    _D.sync()
 
 
 def click_root(x: int, y: int, button: int = 1) -> None:
@@ -195,7 +185,7 @@ def pick_win(wins, want: str):
 
 def shot(name: str, clip: Path, cfg: dict, act=None, warm: float = 4.0,
          pad: int = 0, pick: str = "largest", reveal: bool = False,
-         act_delay: float = 1.0, release_after: int | None = None) -> bool:
+         act_delay: float = 1.0) -> bool:
     home = SCR / f"home-{name}"
     shutil.rmtree(home, ignore_errors=True)
     home.mkdir(parents=True)
@@ -223,8 +213,6 @@ def shot(name: str, clip: Path, cfg: dict, act=None, warm: float = 4.0,
                 rect = pick_win(wins, pick)
         out = OUT / f"{name}.png"
         capture(rect, out, pad=pad)
-        if release_after:
-            release_root(release_after)
         print(f"  {name}: {rect['w']}x{rect['h']} -> {out.name}")
         return out.exists() and out.stat().st_size > 20_000
     finally:
@@ -246,14 +234,11 @@ def main() -> int:
     ok["hero"] = shot("hero", clips["fractal.mp4"], slow, reveal=True)
     ok["clean"] = shot("clean", clips["fractal.mp4"], fast, warm=6.0)
 
-    def open_menu(rect):
-        # GTK dismisses popups on focus-out, which is instant with no window
-        # manager under Xvfb — hold the button so the menu is still up when
-        # the frame is grabbed (released right after the capture).
-        press_root(rect["x"] + rect["w"] // 2, rect["y"] + rect["h"] // 2, 3)
-
-    ok["menu"] = shot("menu", clips["bars_1080.mp4"], slow, act=open_menu,
-                      pad=0, reveal=True, act_delay=0.25, release_after=3)
+    # No context-menu screenshot: GTK pops are override-redirect and are
+    # dismissed on focus-out the instant there is no window manager to keep
+    # the grab, which is exactly the Xvfb case. The window does appear in the
+    # X tree for a frame, but it is never visible in a grabbed image. Claiming
+    # otherwise would mean shipping a picture of something that is not there.
 
     def open_settings(rect):
         key_combo("comma", ctrl=True,

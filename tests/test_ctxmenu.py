@@ -130,6 +130,38 @@ class TestSections(unittest.TestCase):
         self.assertTrue(any("no audio" in l for l, *_r in rows))
 
 
+class TestFullWiring(unittest.TestCase):
+    """R8-A: with the top menu bar deleted, this model is the ONLY home
+    of those features — every row (header included) must resolve to the
+    ctx action group, and the six features of the former bar must all be
+    present in body order next to the disabled header."""
+
+    BODY = ["Audio", "Subtitles", "Repeat", "Playlist", "Chapters",
+            "Tracks"]
+
+    def _walk(self, rows, out):
+        for label, act, _t, sub in rows:
+            out.append((label, act, sub is not None))
+            if sub:
+                self._walk(sub, out)
+
+    def test_every_row_targets_ctx_group(self):
+        for snap in (FULL, {}):
+            out = []
+            self._walk(flat(snap), out)
+            self.assertTrue(out)
+            for label, act, sub in out:
+                if sub:
+                    continue    # submenu parent: its LEAVES carry actions
+                self.assertTrue(str(act).startswith("ctx."),
+                                f"{label!r} -> {act!r}")
+
+    def test_seven_entries_header_plus_six_features(self):
+        rows = flat(FULL)
+        self.assertEqual([r[0] for r in rows],
+                         ["file.mkv"] + self.BODY)
+
+
 class TestTrackLabel(unittest.TestCase):
     def test_marker_and_fields(self):
         self.assertEqual(

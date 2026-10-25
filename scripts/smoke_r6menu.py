@@ -7,8 +7,9 @@ pointer with the exact brief entry set, insensitive-but-present entries
 for data the file lacks, Escape and click-away dismiss WITHOUT toggling
 playback, a right-button drag neither opens the menu nor moves the
 window, and the Repeat radio lands on the real mpv loop properties.
-Phase 2 (fresh process, ui.show_top_menu off, top bar absent from the
-widget tree) proves the identical menu still works.
+Phase 2 (fresh process whose config still carries the R8-DELETED
+ui.show_top_menu key — loaded silently, no consumer left, no bar anywhere)
+proves the identical menu still works.
 """
 import json
 import os
@@ -374,10 +375,32 @@ def base_schedule(app, phase):
     def s_top_phase():
         w = win()
         if phase == "2":
-            check("top_menu_off_tree",
-                  w.chrome.top.get_parent() is None
-                  and not in_tree(w.overlay, w.chrome.top),
-                  str(w.chrome.top.get_parent()))
+            # R8-A: the top menu bar is gone for EVERY config (this config
+            # still carries the dead ui.show_top_menu key — it loads
+            # silently, deep_merge merely preserves it, NOTHING consumes
+            # it any more).  Tree walk: no MenuButton anywhere, no
+            # chrome.top widget, no DEFAULTS entry.
+            import gi
+            gi.require_version("Gtk", "4.0")
+            from gi.repository import Gtk
+            import config as C
+
+            mb = []
+
+            def walk(node):
+                if isinstance(node, Gtk.MenuButton):
+                    mb.append(node)
+                c = node.get_first_child()
+                while c is not None:
+                    walk(c)
+                    c = c.get_next_sibling()
+
+            walk(w)
+            check("top_bar_absent_phase2",
+                  not mb and not hasattr(w.chrome, "top"), f"mb={len(mb)}")
+            check("dead_key_not_a_setting_phase2",
+                  "show_top_menu" not in C.DEFAULTS.get("ui", {}),
+                  str(sorted((C.DEFAULTS.get("ui") or {}))))
             rows = body_rows()   # rebuild + compare identical order
             labels = [r[0] for r in rows]
             check("menu_identical_without_top_menu",

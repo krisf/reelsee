@@ -260,10 +260,14 @@ def run(argv: list[str] | None = None, on_app=None) -> int:
             # (or nothing, before the first tick).
             for w in list(getattr(self, "windows", ())):
                 w.capture_resume_position()
+                w.capture_geometry()     # R10-A: window.json survives quit too
             for name in ("_resume_store_obj", "_ab_store_obj"):
                 st = getattr(self, name, None)
                 if st is not None:
                     st.persist()
+            st = getattr(self, "_geometry_store_obj", None)
+            if st is not None:
+                st.flush()               # even a windowless quit flushes dirty
             return Gtk.Application.do_shutdown(self)
 
         # ------------------------------------------------------------ ab.json
@@ -288,6 +292,19 @@ def run(argv: list[str] | None = None, on_app=None) -> int:
                 st = self._resume_store_obj = ResumeStore()
             return st
 
+        # -------------------------------------------------------- window.json
+        @property
+        def geometry_store(self):
+            """R10-A: the last WINDOWED rect lives in <state>/window.json —
+            runtime state, NOT user config (nobody hand-edits where a window
+            happened to be).  Lazy like ab_store; lazy-loading is also the
+            corrupt-file gate (missing/garbage ⇒ None ⇒ default behaviour)."""
+            st = getattr(self, "_geometry_store_obj", None)
+            if st is None:
+                from config import GeometryStore
+                st = self._geometry_store_obj = GeometryStore()
+            return st
+
         # ------------------------------------------------------------ opening
         def _engine_choice(self):
             """P8 round-robin: with engine.decoder == auto each new window
@@ -303,11 +320,30 @@ def run(argv: list[str] | None = None, on_app=None) -> int:
         def _spawn_window(self, present: bool = True) -> ReelseeWindow:
             w = ReelseeWindow(self, cfg, self.lib,
                               engine_override=self._engine_choice())
+            # R10-B.1/B.2: with a window already open the new one takes the
+            # source's EXACT size at a cascaded position (chained windows
+            # cascade from the MOST RECENT one); as the only window it
+            # restores the remembered rect; with neither, round-8 defaults.
+            # Size lands BEFORE present, position AFTER — Xlib can only move
+            # a surface that exists (GTK 4 has no move API at all).
+            plan = w.plan_open_geometry(self._cascade_source())
+            if plan is not None:
+                w.adopt_geometry(plan[1])
             self.windows.append(w)
             self.registry.add(w)
             if present:
                 w.present()
+                if plan is not None:
+                    w.apply_open_position()
             return w
+
+        def _cascade_source(self) -> ReelseeWindow | None:
+            """The window a new one cascades from: the most recent LIVE one,
+            or None (fresh launch ⇒ restore path, §B.1 ordering)."""
+            for w in reversed(getattr(self, "windows", ())):
+                if not w._closing:
+                    return w
+            return None
 
         def do_activate(self):  # noqa: N802 (GTK virtual)
             if self._opened:

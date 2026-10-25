@@ -32,6 +32,19 @@ export REELSEE_HEADLESS=1
 unset WAYLAND_DISPLAY
 mkdir -p scratch/xvfb-tmp scratch/smoke
 export TMPDIR="$here/scratch/xvfb-tmp"
+# R10 hygiene: window.json (the remembered window rect, R10-A) made
+# start-up geometry LOAD-BEARING for every smoke.  Static scratch state
+# dirs are reused across invocations on purpose (resume/ab/engines
+# continuity is asserted by multi-process smokes), but a leftover rect
+# restores run-N-1's window size/position into run-N and breaks
+# fresh-window premises (measured: aspectlock restored (1067,600) and
+# drag restored (180,180) from the previous battery run, failing 3 and 1
+# gates deterministically).  Geometry is purged per invocation; the
+# per-PID dirs used by smokes that TEST geometry persistence
+# (r9rep-state-*, r10wg-state-*) don't match *-state and are untouched.
+rm -f scratch/smoke/*-state/window.json 2>/dev/null || true
+rm -f "${REELSEE_STATE_DIR:-$HOME/.local/state/reelsee}/window.json" \
+    2>/dev/null || true
 
 log="scratch/smoke/$name.log"
 start=$SECONDS

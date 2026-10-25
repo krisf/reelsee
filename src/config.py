@@ -16,6 +16,8 @@ import threading
 import time
 from pathlib import Path
 
+import wingeom
+
 VERSION = 1
 
 DEFAULTS: dict = {
@@ -45,10 +47,14 @@ DEFAULTS: dict = {
            "seek_step_long_s": 30, "theme": "black", "ontop": False,
            "title_format": "${media-title} — REELSEE",
            "screenshot_clipboard": False,
-           # R5-B: the in-video top menu bar (playlist/chapters/tracks +
-           # filename label).  Off = REMOVED from the widget tree; the
-           # headerbar keeps the filename and every action keeps its key.
-           "show_top_menu": True},
+           # R8-B: a drag keeps the video's shape (observed dwidth/dheight).
+           # GTK 4 has no geometry hints left, so the window CORRECTS its
+           # size on Gdk.Surface::layout — math in src/aspect.py.
+           "lock_aspect": True,
+           # R10: remember the last WINDOWED rect (<state>/window.json, NOT
+           # this file) and cascade new windows off the open one.  The
+           # remembered GEOMETRY is state; these two are the user's policy.
+           "remember_geometry": True, "cascade_offset_px": 50},
     "subtitles": {"visible": True, "scale": 1.0, "delay_s": 0.0,
                   "auto": "exact", "font": "sans-serif", "font_size": 55.0,
                   "color": "#ffffff", "border_size": 3.0, "margin_y": 50.0},
@@ -63,7 +69,12 @@ DEFAULTS: dict = {
 }
 
 # Keys whose user changes must hit the disk immediately, not debounced (R-4).
-PERSIST_NOW_KEYS = {("audio", "muted"), ("audio", "volume")}
+# R9-A: the two repeat keys join mute/volume — the bar is "survives a
+# restart, LIKE MUTE DOES": with a 250 ms debounce and no shutdown flush,
+# a toggle followed by a quick quit would still be lost.
+PERSIST_NOW_KEYS = {("audio", "muted"), ("audio", "volume"),
+                    ("playback", "loop_file"),
+                    ("playback", "loop_playlist")}
 
 DEBOUNCE_S = 0.25
 
@@ -353,3 +364,104 @@ class EnginesStore(StateStore):
         if entry and time.time() - entry.get("ts", 0) < self.TTL_S:
             return entry
         return None
+
+
+class GeometryStore:
+    """R10-A: the last WINDOWED window rect — runtime STATE, not config.
+
+    Lives in `<state>/window.json` (next to resume.json), deliberately not
+    in the user config: it is where the last window happened to be, a
+    machine fact nobody edits.  Discipline, all of it pinned by
+    tests/test_wingeom.py:
+
+      * missing / corrupt / nonsense file ⇒ last() is None and NOTHING
+        raises — the app opens with the default behaviour (§A.3);
+      * only windowed rects are remembered: remember(..., windowed=False)
+        (closing while fullscreen or maximized) keeps the previously
+        remembered rect byte-for-byte (§A.2);
+      * writes are debounced (DEBOUNCE_S, like the config) and flush()
+        fires on close/quit even when the debounce never got its turn —
+        "save on quit" is a promise, not a race (§A.1).
+    """
+
+    def __init__(self, path: Path | None = None,
+                 debounce_s: float = DEBOUNCE_S):
+        self.path = Path(path) if path else state_dir() / "window.json"
+        self.debounce_s = debounce_s
+        self._lock = threading.Lock()
+        self._timer: threading.Timer | None = None
+        self._dirty = False
+        raw = load_raw(self.path)
+        rect = wingeom.valid_rect(raw.get("rect") if raw else None)
+        self._rect: tuple | None = rect      # the remembered windowed rect
+        self._monitor = wingeom.valid_monitor(
+            raw.get("monitor") if raw else None)
+
+    # -- read ----------------------------------------------------------------
+    def last(self) -> tuple[int, int, int, int] | None:
+        """The remembered rect (x, y, w, h), or None ("never saved / corrupt")."""
+        with self._lock:
+            return self._rect
+
+    def last_monitor(self) -> int | None:
+        """Monitor index the rect was remembered on, or None (unknown)."""
+        with self._lock:
+            return self._monitor
+
+    # -- write ---------------------------------------------------------------
+    def remember(self, rect, monitor: int | None = None, *,
+                 windowed: bool = True, persist: bool = True) -> bool:
+        """Update the remembered rect and schedule the debounced write.
+
+        windowed=False is a NO-OP on the value (§A.2: a fullscreen close
+        must leave the remembered size intact) — it still reports False so
+        the caller can see that nothing changed.  An invalid rect is
+        dropped silently: garbage from a buggy caller is treated exactly
+        like a corrupt file.
+        """
+        if not windowed:
+            return False
+        r = wingeom.valid_rect(rect)
+        if r is None:
+            return False
+        mon = wingeom.valid_monitor(monitor)
+        with self._lock:
+            changed = (r != self._rect or mon != self._monitor)
+            self._rect, self._monitor = r, mon
+            if not changed and not self._dirty:
+                return True                  # same value on disk already
+            self._dirty = True
+            if not persist:
+                return True
+            self._schedule_flush()
+        return True
+
+    def _schedule_flush(self) -> None:
+        """Debounced write; caller must hold _lock (Config's pattern)."""
+        if self._timer is not None:
+            self._timer.cancel()
+        self._timer = threading.Timer(self.debounce_s, self.flush)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def flush(self) -> None:
+        """Persist NOW — the close/quit guarantee: even if the debounce
+        has not fired, the last windowed rect lands on disk."""
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            if not self._dirty:
+                return
+            payload = {"version": VERSION, "rect": None, "monitor": None}
+            if self._rect is not None:
+                x, y, w, h = self._rect
+                payload["rect"] = {"x": x, "y": y, "w": w, "h": h}
+                payload["monitor"] = self._monitor
+            self._dirty = False
+        try:
+            save_atomic(self.path, payload)  # SYNC-FS-OK (atomic, R2)
+        except OSError as exc:               # best-effort, like StateStore
+            import logging
+            logging.getLogger("reelsee.config").warning(
+                "window geometry write failed (%s): %s", self.path, exc)

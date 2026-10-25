@@ -22,13 +22,21 @@ run mpv_roundtrip 60 smoke_mpv_roundtrip.py
 run close         45 smoke_close.py
 run chrome        45 smoke_chrome.py
 run adwchrome    120 smoke_adwchrome.py
-run topmenu      180 smoke_topmenu.py
-# D1 (R7): the debounced-flush race in this gate proved FLAKY once;
-# fixed with a poll-the-disk deadline — the battery now runs it 3x in
-# a row so any regression in that race fails the battery, not CI luck.
-run topmenu_b    180 smoke_topmenu.py
-run topmenu_c    180 smoke_topmenu.py
+# R8-A: the topmenu gate (ui.show_top_menu) was sanctioned-DELETED with
+# the bar itself; nomenubar replaces it and, per brief §C, runs 3x in a
+# row so a regression in the dead-key load / tree absence fails the
+# battery, not CI luck.
+run nomenubar    180 smoke_nomenubar.py
+run nomenubar_b  180 smoke_nomenubar.py
+run nomenubar_c  180 smoke_nomenubar.py
 run repeat        90 smoke_repeat.py
+# R9-C: the repeat-PERSISTENCE gate, 3x in a row like nomenubar — each
+# run is three real processes (set one -> quit -> restart proves the
+# seed + reload/next/prev/r-key persistence -> restart proves off
+# persists too); three agreeing runs beat one lucky one.
+run repeatpersist   360 smoke_repeatpersist.py
+run repeatpersist_b 360 smoke_repeatpersist.py
+run repeatpersist_c 360 smoke_repeatpersist.py
 run drag          150 smoke_drag.py
 run abclear        90 smoke_abclear.py
 run settings      45 smoke_settings.py
@@ -48,5 +56,16 @@ run r6menu       300 smoke_r6menu.py
 run r6bar        150 smoke_r6_bar.py
 run r6mute       150 smoke_r6_mute_restart.py
 run r7decode     150 smoke_r7_decode.py
+# R8-B: aspect-locked window resizing (observed dwidth/dheight,
+# debounce+guard, work-area clamp, vertical video, toggle off = free).
+run aspectlock   180 smoke_aspectlock.py
+# R10-D: remembered window geometry + exact-size cascade placement over
+# raw Xlib, plus the Wayland-style no-xid degrade.  One script drives all
+# three phases (remember + disk record -> restore + cascade + right-edge
+# flip -> fake-FakeSurface open path); three runs catch flakes the same
+# way nomenubar/repeatpersist do.
+run wingeom      300 smoke_wingeom.py
+run wingeom_b    300 smoke_wingeom.py
+run wingeom_c    300 smoke_wingeom.py
 echo "BATTERY_SUMMARY fails=$fails"
 [ "$fails" -eq 0 ]

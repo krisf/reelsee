@@ -15,6 +15,7 @@ import time
 import gi
 
 import ab as AB
+import aspect
 import chrome
 import config as C
 import ctxmenu
@@ -23,6 +24,8 @@ import keymap
 import mpvlib as M
 import reelsee_io
 import watchdog as WD
+import wingeom
+import x11pos
 from mpvcore import MpvCore
 from render import RenderView
 
@@ -32,6 +35,21 @@ gi.require_version("Pango", "1.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
 log = logging.getLogger("reelsee.window")
+
+
+def make_aspect_lock_action(on: bool) -> Gio.SimpleAction:
+    """`win.toggle-aspect-lock` — the command-palette/settings surface of
+    `ui.lock_aspect`, built in ONE place because its shape carries a trap.
+
+    A stateful action whose state is BOOLEAN must be created with
+    parameter_type=None: declaring a "b" parameter type makes
+    `activate_action(name, None)` — exactly what a command palette does —
+    trip g_simple_action_activate's assertion, and the action then silently
+    never fires.  Measured on this build, so the construction lives here
+    where a unit test can pin it without a display (tests/test_aspect.py).
+    """
+    return Gio.SimpleAction.new_stateful(
+        "toggle-aspect-lock", None, GLib.Variant("b", bool(on)))
 
 WINDOW_EXTRA_OBSERVED = {
     "playlist-count": M.MPV_FORMAT_INT64,
@@ -49,7 +67,26 @@ WINDOW_EXTRA_OBSERVED = {
     "ab-loop-a": M.MPV_FORMAT_STRING,
     "ab-loop-b": M.MPV_FORMAT_STRING,
     "loop-playlist": M.MPV_FORMAT_STRING,
+    # R8-B: THE aspect source.  dwidth/dheight are mpv's DISPLAYED dimensions
+    # — the size the picture is drawn at, after container/aspect handling — so
+    # a 1080x1920 phone clip comes out vertical and a 1920x1080 clip wide.
+    # width/height (coded size) is the documented fallback for the moment
+    # before a display size exists.  Measured on this build: 1920/1080 for the
+    # 16:9 test clip, and `video-rotate` moves NEITHER of them (rotation is
+    # applied at render time), so the observed display size stays the single
+    # source of truth — never a re-derived or cached value.  Snapshot-only
+    # reads (R9).
+    "dwidth": M.MPV_FORMAT_INT64,
+    "dheight": M.MPV_FORMAT_INT64,
+    "width": M.MPV_FORMAT_INT64,
+    "height": M.MPV_FORMAT_INT64,
 }
+
+
+# The window's opening size.  16:9 on purpose: R8-B compares it with the
+# loaded video's aspect before deciding to move the window at all (a 16:9
+# file in a 16:9 window must not cause a single resize).
+START_SIZE = (960, 540)
 
 
 def _abs_entry(u):
@@ -147,12 +184,8 @@ class ReelseeWindow(Adw.ApplicationWindow):
             on_repeat=self._repeat_cycle,
             on_decode=self._toggle_decode)   # R7-B: the decode toggle
         for c in self.chrome.overlay_children():
-            # R5-B: ui.show_top_menu off ⇒ the in-video menu bar (playlist/
-            # chapters/tracks buttons + filename label) is NOT in the widget
-            # tree at all — not merely hidden.
-            if c is self.chrome.top and not bool(
-                    config.get("ui.show_top_menu", True)):
-                continue
+            # R8-A: every child is added UNCONDITIONALLY — the deleted top
+            # menu bar is not returned at all (it exists for NO config).
             self.overlay.add_overlay(c)
         mc = Gtk.EventControllerMotion()
         mc.connect("motion", lambda _c, x, y: self.chrome.motion(
@@ -187,7 +220,36 @@ class ReelseeWindow(Adw.ApplicationWindow):
         self.view.area.add_controller(rclick)
         self._click_gestures = (click, rclick)   # structural introspection
 
-        self.set_default_size(960, 540)
+        # ---- R8-B aspect-locked resize ------------------------------------
+        # GTK 4 has no geometry hints left, so the window CORRECTS its own
+        # size when a drag breaks the video's shape (src/aspect.py has every
+        # decision; the fields below are plumbing).
+        self._aspect_surf = None          # surface we listen to (re-wired)
+        self._aspect_size = None          # last (w, h) the surface reported
+        self._aspect_pending = None       # (w, h) waiting for the debounce
+        self._aspect_debounce_id = None   # ONE timer at a time == at most
+        self._aspect_guard_id = None      # one correction per burst
+        self._aspect_file_id = None       # new-file relayout source
+        self._aspect_applying = False     # re-entrancy: never chase our own
+        self._aspect_applied = None       # last size WE asked for
+        self._aspect_free_until = 0.0     # fullscreen-settle deadline
+        self._aspect_debounce_ms = aspect.DEBOUNCE_MS   # gate-tunable knob
+        self._aspect_corrections = 0      # honest counter (smokes read it)
+        self._aspect_lock_action = None   # bound in _build_actions
+
+        # ---- R10 remembered geometry / cascade placement ------------------
+        # The WHERE-decisions are pure functions in src/wingeom.py (unit
+        # tested); the Xlib placement seam is src/x11pos.py (never raises);
+        # the last WINDOWED rect lives in <state>/window.json via the app's
+        # GeometryStore — runtime state, deliberately NOT user config.
+        self._geom_rect = None            # last KNOWN windowed (x,y,w,h)
+        self._geom_open = None            # opening rect awaiting its configure
+        self._geom_adopted = False        # size came from source/memory (R10-B.1)
+        self._geom_id = None              # 1 s move/size sampler
+        self._geom_timer = None           # debounced persist (~250 ms)
+        self._geom_guard_id = None        # placement-echo guard release
+
+        self.set_default_size(*START_SIZE)
         self._update_title()
 
         self.keymap = dict(keymap.DEFAULT_BINDINGS)
@@ -201,6 +263,10 @@ class ReelseeWindow(Adw.ApplicationWindow):
         self._tick_id = GLib.timeout_add(10, self._tick)
         # §7 T1 resume: cheap dict write every 5 s, flushed on window close
         self._resume_id = GLib.timeout_add(5000, self._resume_tick)
+        # R10: user drags move the window with NO GTK signal a WM guarantees
+        # (GDK 4 has no move event exposed here) — a 1 s Xlib sample is the
+        # honest "did it move?" detector; persistence is debounced on top.
+        self._geom_id = GLib.timeout_add(1000, self._geom_sample)
 
         # R-7 overload watchdog (Appendix C): 1 s samples from the Snapshot
         self.watchdog = WD.Watchdog(
@@ -228,6 +294,15 @@ class ReelseeWindow(Adw.ApplicationWindow):
             self.watchdog.set_engine(chain=None, is_cpu=True)
 
         self.connect("close-request", self._on_close_request)
+
+        # R8-B: the resize truth lives on the SURFACE, not the window, and
+        # the surface object can be replaced — so (re-)wire it on every map.
+        self.connect("map", self._wire_aspect_surface)
+        # A surface is not permanent (fullscreen re-creates the GL surface),
+        # and a layout connection on a dead surface would switch the lock off
+        # in total silence — so re-wire on the replacement itself, not only
+        # on the next map.
+        self.connect("notify::surface", self._wire_aspect_surface)
 
         # R-audio focus policy (§4.10): only the focused window keeps audio
         self.connect("notify::is-active", self._on_active)
@@ -308,10 +383,10 @@ class ReelseeWindow(Adw.ApplicationWindow):
         self._open_context_menu(float(x), float(y))
 
     def _open_context_menu(self, x: float, y: float) -> None:
-        """Fresh snapshot-derived model, popped up AT the pointer.  The
-        ui.show_top_menu setting has zero influence: this path never
-        touches chrome.top (it exists or it does not — the menu is the
-        same object either way)."""
+        """Fresh snapshot-derived model, popped up AT the pointer.
+        R8-A: this is THE menu — every feature the deleted top menu bar
+        had lives here (header + Audio, Subtitles, Repeat, Playlist,
+        Chapters, Tracks), wired to the same handlers."""
         pop = getattr(self, "_ctx_pop", None)
         if pop is None or self._closing:
             return
@@ -323,8 +398,8 @@ class ReelseeWindow(Adw.ApplicationWindow):
 
     def _build_context_menu(self) -> None:
         """The ctx.* action half of the right-click menu.  EVERY entry
-        routes to the SAME command the top-menu popover or the keymap
-        already issues — this wires, it never reimplements."""
+        routes to the SAME command the playlist/chapters/tracks popovers
+        or the keymap already issues — this wires, it never reimplements."""
         ag = Gio.SimpleActionGroup()
         self.insert_action_group("ctx", ag)
         noop = Gio.SimpleAction(name="noop")
@@ -354,8 +429,15 @@ class ReelseeWindow(Adw.ApplicationWindow):
             "set", "playlist-index", str(p.get_int32())), _i)
         add("goto-chapter", lambda p: self.core.command(
             "set", "chapter", str(p.get_int32())), _i)
+        # R9-A: seed the radio state (and _rep_mode) from the PERSISTED
+        # mode so a restart opens already-checked — the seeded mpv init
+        # options (engine.mpv_init_options) make the OBSERVED properties
+        # agree from the first snapshot, so this matches the derivation
+        # instead of racing it.  Unrecognised stored value → "off".
+        _rep_seed = chrome.repeat_mode(self.cfg.get("playback.loop_file"),
+                                       self.cfg.get("playback.loop_playlist"))
         self._ctx_repeat = Gio.SimpleAction.new_stateful(
-            "repeat", GLib.VariantType("s"), GLib.Variant("s", "off"))
+            "repeat", GLib.VariantType("s"), GLib.Variant("s", _rep_seed))
         self._ctx_repeat.connect(
             "change-state",
             # NOTE: Variant.get_string() here returns the str directly,
@@ -363,7 +445,7 @@ class ReelseeWindow(Adw.ApplicationWindow):
             # slice "one" to "o" (probe-proven).  unpack() is unambiguous.
             lambda a, v: self._set_repeat_mode(v.unpack(), action=a))
         ag.add_action(self._ctx_repeat)
-        self._rep_mode = "off"
+        self._rep_mode = _rep_seed
         self._ctx_pop = Gtk.PopoverMenu(menu_model=ctxmenu.build(
             self.core.snapshot))
         self._ctx_pop.set_parent(self.view.area)
@@ -375,12 +457,31 @@ class ReelseeWindow(Adw.ApplicationWindow):
                          action: Gio.SimpleAction | None = None) -> None:
         """ONE writer for the repeat tri-state — the bottom-bar cycle
         button AND the context-menu radio (change-state) both land here;
-        the truth stays the two mpv loop properties (R5-C contract)."""
+        the truth stays the two mpv loop properties (R5-C contract).
+
+        R9-A (the persistence bug): this writer used to touch ONLY the
+        live properties.  Every replace-load runs `_push_all_settings()`,
+        which re-applies `playback.loop_file`/`playback.loop_playlist`
+        from config — the DEFAULTS ("no"/"no") unless the choice is
+        written back HERE, at the one place that knows the mode.  So
+        both keys are persisted on every change (PERSIST_NOW, like
+        mute): the pre-load push now RE-APPLIES the user's mode instead
+        of erasing it, same-file reload / next-prev / restart all agree.
+        The mpv properties remain the ONLY display truth; config is
+        never read to paint anything except at init seeding."""
         loop_file, loop_playlist = chrome.repeat_props(mode)
         self.core.command("set", "loop-file", loop_file)
         self.core.command("set", "loop-playlist", loop_playlist)
-        if action is not None:
-            action.set_state(GLib.Variant("s", mode))
+        self.cfg.set("playback.loop_file", loop_file)
+        self.cfg.set("playback.loop_playlist", loop_playlist)
+        # the radio follows EVERY write, button path included: _rep_mode
+        # is pre-set below precisely so the snapshot echo does not
+        # double-persist, which also means _sync_repeat would never
+        # reach its set_state for this transition.
+        act = action if action is not None else getattr(
+            self, "_ctx_repeat", None)
+        if act is not None:
+            act.set_state(GLib.Variant("s", mode))
         self._rep_mode = mode
         self.chrome.set_repeat(mode)     # immediate feedback (pre-snapshot)
         self.chrome.show_osd("Repeat: " + mode)
@@ -407,25 +508,9 @@ class ReelseeWindow(Adw.ApplicationWindow):
         hand-rolled animation anywhere (Looksee pattern)."""
         self._toolbar.set_reveal_top_bars(bool(visible))
 
-    def _apply_top_menu_setting(self, on: bool) -> None:
-        """R5-B: ui.show_top_menu — off means the in-video menu bar (the
-        playlist/chapters/tracks buttons + filename label, i.e. the whole
-        Chrome.top) is REMOVED from the widget tree — it takes no space,
-        receives no clicks, cannot be tab-focused — and back into the tree
-        on a live toggle to on.  The headerbar title (R5-A) keeps the
-        filename, and every action keeps its existing shortcut
-        (a/v subs+audio, l/r loops, b/n playlist, PgUp/PgDn chapters)."""
-        top = self.chrome.top
-        parent = top.get_parent()
-        if on:
-            if parent is None:
-                self.overlay.add_overlay(top)
-                top.set_child_visible(self.chrome.bars_visible)
-        elif parent is not None:
-            if isinstance(parent, Gtk.Overlay):
-                parent.remove_overlay(top)   # GtkOverlay has no remove()
-            else:
-                parent.remove(top)
+    # R8-A: the former _apply_top_menu_setting() (ui.show_top_menu) is GONE
+    # entirely — the setting has no default, no settings row and no
+    # handler, and the bar it once toggled has no widget at all.
 
     def _on_active(self, *_a) -> None:
         if self.is_active():
@@ -615,6 +700,13 @@ class ReelseeWindow(Adw.ApplicationWindow):
         self._arm_engine_watch()                # R2-P2/I1 engagement ladder
         self._pl_sig = self._ch_sig = None      # force popover refresh
         self._chapter_idx = self._track_sig = None
+        # R8-B: "vertical video opens vertical", but only once mpv actually
+        # knows the display geometry — hence deferred.  Placed LAST: it must
+        # not disturb the resume / AB / watchdog / engine work above, and it
+        # touches none of it.
+        if self._aspect_file_id is not None:
+            GLib.source_remove(self._aspect_file_id)
+        self._aspect_file_id = GLib.timeout_add(150, self._aspect_on_file, 20)
 
     # ------------------------------------------------- R2-P2/I1 engagement
     def _arm_engine_watch(self, apply_now: bool = False):
@@ -882,7 +974,30 @@ class ReelseeWindow(Adw.ApplicationWindow):
         if self._resume_id is not None:
             GLib.source_remove(self._resume_id)
             self._resume_id = None
+        # R8-B: a pending correction or a file-poll outliving the window
+        # would resize a dead surface (and spam a traceback per tick).
+        for _sid in ("_aspect_debounce_id", "_aspect_guard_id",
+                     "_aspect_file_id"):
+            _src = getattr(self, _sid, None)
+            if _src is not None:
+                GLib.source_remove(_src)
+                setattr(self, _sid, None)
+        self._aspect_pending = None
+        self._aspect_applying = False
         self._closing = True
+        # R10: the geometry sampler/timers die with the window, and the
+        # CURRENT windowed rect must reach disk even if the 250 ms debounce
+        # never got its turn (quit without a close fires the same capture
+        # from ReelseeApp.do_shutdown — app.quit() skips close-request).
+        if self._geom_id is not None:
+            GLib.source_remove(self._geom_id)
+            self._geom_id = None
+        for _sid in ("_geom_timer", "_geom_guard_id"):
+            _src = getattr(self, _sid, None)
+            if _src is not None:
+                GLib.source_remove(_src)
+                setattr(self, _sid, None)
+        self.capture_geometry()
         if self._url_resolver is not None:
             self._url_resolver.cancel()
         if self._folder_monitor is not None:      # §4.8 IO teardown
@@ -900,6 +1015,461 @@ class ReelseeWindow(Adw.ApplicationWindow):
     def dispose(self) -> None:  # noqa: D102 (GTK virtual)
         self.view.teardown()
         super().dispose()
+
+    # ------------------------- R10 remembered geometry / cascade placement --
+    # Every WHERE-decision is a pure function in src/wingeom.py (unit-tested
+    # in tests/test_wingeom.py); this side is plumbing plus the Xlib seam
+    # (src/x11pos.py) that GTK 4 refuses to offer.  Rules that live here:
+    #   * a NEW window takes the source window's EXACT size + shifted
+    #     position (cascade_place), the aspect lock does NOT refit it;
+    #   * only a WINDOWED rect is ever remembered (§A.2) — closing while
+    #     fullscreen or maximized leaves the remembered rect untouched;
+    #   * debounced saves (~250 ms) with an unconditional flush on close
+    #     and on quit (§A.1);
+    #   * no X11 (Wayland) ⇒ size-only degradation, one debug log, no raise.
+
+    def _geom_enabled(self) -> bool:
+        """ui.remember_geometry is read LIVE (a settings flip affects the
+        NEXT window without restart)."""
+        return bool(self.cfg.get("ui.remember_geometry", True))
+
+    def _geom_offset(self) -> int:
+        try:
+            return max(0, min(200, int(
+                self.cfg.get("ui.cascade_offset_px", 50))))
+        except (TypeError, ValueError):
+            return 50
+
+    def _geom_monitor_areas(self) -> list:
+        try:
+            mons = self.get_display().get_monitors()
+        except Exception:                       # noqa: BLE001
+            mons = []
+        return wingeom.work_areas(mons)
+
+    def _geom_monitor_index(self, rect):
+        """Which monitor the rect sits on (the index stored with it, §A)."""
+        try:
+            geos = [m.get_geometry()
+                    for m in self.get_display().get_monitors()]
+        except Exception:                       # noqa: BLE001
+            return None
+        return wingeom.pick_monitor(rect, wingeom.work_areas(geos))
+
+    def _geom_windowed(self) -> bool:
+        try:
+            return not (self._fs or self.is_fullscreen()
+                        or self.is_maximized())
+        except Exception:                       # noqa: BLE001
+            return False
+
+    def _geom_live_rect(self):
+        """Root-relative (x, y, w, h): the Xlib truth on X11; anywhere else
+        the size-only fallback (position stays whatever was last known)."""
+        live = x11pos.get_rect(self)
+        if live is not None:
+            return live
+        try:
+            w, h = self.get_width(), self.get_height()
+        except Exception:                       # noqa: BLE001
+            return None
+        if w <= 1 or h <= 1:
+            return None
+        px, py = self._geom_rect[:2] if self._geom_rect else (0, 0)
+        return (px, py, w, h)
+
+    def rect_for_cascade(self):
+        """The rect a NEW window cascades from: the LIVE one while windowed,
+        else the last windowed rect this window actually had — never a
+        fullscreen or maximized geometry (§B.2, same rule as §A.2)."""
+        if self._geom_windowed():
+            live = x11pos.get_rect(self)
+            if live is not None:
+                self._geom_rect = live
+        return self._geom_rect
+
+    def plan_open_geometry(self, source):
+        """(mode, rect) for THIS window, or None ⇒ plain default behaviour.
+
+        Ordering (the §B.1 state table): a live source window ⇒ "cascade"
+        (exact source size, cascaded position on the SOURCE monitor);
+        no source but a remembered rect ⇒ "restore" (clamped into that
+        monitor's work area, size never grown); neither ⇒ None, and the
+        round-8 defaults (START_SIZE + initial aspect fit) stand.
+        """
+        if not self._geom_enabled():
+            return None
+        if source is not None:
+            srect = source.rect_for_cascade()
+            if srect is not None:
+                rect = wingeom.cascade_place(srect, self._geom_monitor_areas(),
+                                             self._geom_offset())
+                if rect is not None:
+                    return ("cascade", rect)
+        stored = self.app.geometry_store.last()
+        if stored is not None:
+            areas = self._geom_monitor_areas()
+            idx = self.app.geometry_store.last_monitor()
+            if idx is None or idx >= len(areas):
+                idx = wingeom.pick_monitor(stored, areas)
+            wa = areas[idx] if idx is not None and idx < len(areas) else None
+            rect = wingeom.clamp_into_workarea(stored, wa) if wa else stored
+            if rect is not None:
+                return ("restore", rect)
+        return None
+
+    def adopt_geometry(self, rect) -> None:
+        """Accept an externally chosen opening geometry (§B.1): the EXACT
+        pixel size BEFORE present (GTK resizes a mapped window too, but the
+        user must never see a second size), and the position applied AFTER
+        the surface exists by apply_open_position().  _geom_adopted is the
+        one-shot "don't aspect-refit my first file" flag."""
+        self._geom_rect = tuple(rect)
+        self._geom_open = tuple(rect)
+        self._geom_adopted = True
+        self.set_default_size(rect[2], rect[3])
+
+    def apply_open_position(self, retry: bool = True) -> bool:
+        """present() first, THEN configure: Xlib can only move a surface
+        that exists.  One retry at first-map for an xid that was not ready
+        yet; after that, size-only for good — on Wayland positioning simply
+        does not exist (x11pos logged it once and never raises)."""
+        rect, self._geom_open = self._geom_open, None
+        if rect is None or self._closing:
+            return False
+        self._geom_arm_guard(rect)      # our placement is not a user resize
+        if x11pos.set_rect(self, rect):
+            return True
+        if retry and self.get_surface() is None:
+            GLib.timeout_add(150, lambda: (self.apply_open_position(False),
+                                           False)[1])
+        return False
+
+    def _geom_arm_guard(self, rect) -> None:
+        """The surface-layout echo of our OWN configure must not read as a
+        user resize (§B.1: the aspect lock resumes on the NEXT *user*
+        resize).  Pre-seed the dedupe size and reuse round 8's applying
+        latch when nobody else holds it."""
+        self._aspect_size = (rect[2], rect[3])
+        if self._aspect_applying:
+            return
+        self._aspect_applying = True
+
+        def _off():
+            self._geom_guard_id = None
+            self._aspect_applying = False
+            return False
+        if self._geom_guard_id is not None:
+            GLib.source_remove(self._geom_guard_id)
+        self._geom_guard_id = GLib.timeout_add(
+            aspect.APPLY_GUARD_MS + 60, _off)
+
+    def _geom_consume(self) -> bool:
+        """One-shot: True the first time this window's geometry adoption
+        is honoured (its FIRST file resolution in _aspect_on_file)."""
+        adopted, self._geom_adopted = self._geom_adopted, False
+        return adopted
+
+    def _geom_sample(self):
+        """1 s: the cheap truth about drags and WM moves.  A CHANGED windowed
+        rect schedules the debounced write; a fullscreen rect is never even
+        recorded (§A.2), so nothing downstream can remember it by accident."""
+        if self._closing:
+            return False
+        try:
+            if self._geom_windowed():
+                live = self._geom_live_rect()
+                if live is not None and live != self._geom_rect:
+                    self._geom_rect = live
+                    self._geom_schedule_persist()
+        except Exception:                       # noqa: BLE001
+            log.exception("geometry sample failed")
+        return True
+
+    def _geom_schedule_persist(self):
+        """§A.1: debounced ~250 ms — a resize storm writes once, not 60×."""
+        if self._geom_timer is not None:
+            GLib.source_remove(self._geom_timer)
+        self._geom_timer = GLib.timeout_add(250, self._geom_persist_now)
+
+    def _geom_persist_now(self):
+        self._geom_timer = None
+        self._geom_persist()
+        return False
+
+    def _geom_persist(self):
+        if not self._geom_enabled() or self._geom_rect is None:
+            return
+        self.app.geometry_store.remember(
+            self._geom_rect, self._geom_monitor_index(self._geom_rect))
+
+    def capture_geometry(self) -> None:
+        """§A.1/A.2: the flush-on-close / flush-on-quit promise: sample the
+        CURRENT rect and push it to disk NOW, debounce or not.  Fullscreen
+        or maximized at that moment leaves the previously remembered rect
+        byte-for-byte intact (§A.2's exact scenario)."""
+        try:
+            windowed = self._geom_windowed()
+            if windowed:
+                live = self._geom_live_rect()
+                if live is not None:
+                    self._geom_rect = live
+            store = self.app.geometry_store
+            if self._geom_enabled():
+                store.remember(
+                    self._geom_rect,
+                    self._geom_monitor_index(self._geom_rect)
+                    if self._geom_rect else None,
+                    windowed=windowed)
+            store.flush()
+        except Exception:                       # noqa: BLE001
+            log.exception("geometry capture failed")
+
+    # ------------------------------------------ R8-B aspect-locked resizing
+    # Every DECISION is a pure function in src/aspect.py (unit-tested in
+    # tests/test_aspect.py); this section is signal plumbing plus the three
+    # promises that only the window can keep: never fight the user, never
+    # fight the compositor, never fight ourselves.
+    def _aspect_locked(self) -> bool:
+        """Read LIVE, on every signal: flipping ui.lock_aspect off takes
+        effect on the very next layout event — no restart, no cached flag."""
+        try:
+            return bool(self.cfg.get("ui.lock_aspect", True))
+        except Exception:                          # noqa: BLE001
+            return False
+
+    def _aspect_frozen(self) -> bool:
+        """Geometries that are not ours to correct: fullscreen, maximized,
+        and the moment right after a fullscreen toggle (leaving fullscreen
+        must not snap the window to a size nobody asked for).  self._fs is
+        the app's own flag because X11 without a window manager never sends
+        the state notify back (P2 finding); the real state is secondary."""
+        if self._fs or self.is_fullscreen() or self.is_maximized():
+            return True
+        return time.monotonic() < self._aspect_free_until
+
+    def _work_area(self) -> tuple[int, int]:
+        """The monitor work area: the ceiling a correction may never exceed.
+        Single monitor is the honest assumption (multi-head placement is a
+        window-positioning feature, not an aspect one); the fallback keeps
+        the ceiling real instead of unbounded if GDK has none yet."""
+        try:
+            mons = self.get_display().get_monitors()
+            if mons:
+                r = mons[0].get_workarea()
+                if r.width > 0 and r.height > 0:
+                    return (int(r.width), int(r.height))
+        except Exception:                          # noqa: BLE001
+            log.exception("work area lookup failed; using fallback ceiling")
+        return (1600, 1000)
+
+    def _wire_aspect_surface(self, *_a) -> None:
+        """Gdk.Surface::layout(surface, width, height) is the only resize
+        notification GTK 4 leaves us.  Re-wired on every map: a surface can
+        be replaced (GL context loss, reparent) and a dead connection would
+        disable the lock in total silence."""
+        surf = self.get_surface()
+        if surf is None or surf is self._aspect_surf:
+            return
+        self._aspect_surf = surf
+        surf.connect("layout", self._on_surface_layout)
+
+    def _on_surface_layout(self, _surface, width, height, *_args) -> None:
+        """A size the user or the compositor already gave us.
+
+        Two measured properties of this signal decide the whole design
+        (measured under Xvfb and asserted by scripts/smoke_aspectlock.py,
+        check `storm_quiet_when_paused`): it also fires while merely
+        repainting — about 9 events per 600 ms playing, ~1 paused — always
+        with the CURRENT size, and our own correction answers back through
+        it.  Therefore:
+          * a size equal to the last one we recorded is a repaint or a
+            move, not a resize — that single dedupe defuses the per-frame
+            storm (and a Gtk.WindowHandle move never even comes here: its
+            geometry is untouched, which is exactly the requirement);
+          * the correction is scheduled, never applied inline — ONE timer
+            per burst, armed by the first mismatch and deliberately NOT
+            re-armed by the ones after it, so a fast drag gets exactly one
+            correction and a burst can never postpone itself forever;
+          * while our own correction is in flight nothing is scheduled."""
+        try:
+            size = (int(width), int(height))
+        except (TypeError, ValueError):
+            return
+        same = (size == self._aspect_size)
+        self._aspect_size = size
+        if self._aspect_applying:
+            return          # our own resize echoing back is not a new event
+        if not self._aspect_locked():
+            self._aspect_forget()               # free NOW: no stale state
+            return
+        if same or self._aspect_frozen():
+            return
+        if not aspect.needs_correction(size[0], size[1],
+                                       aspect.aspect_of(self.core.snapshot)):
+            return
+        self._aspect_pending = size
+        if self._aspect_debounce_id is None:     # at most ONE per burst
+            self._aspect_debounce_id = GLib.timeout_add(
+                self._aspect_debounce_ms, self._aspect_correct)
+
+    def _aspect_correct(self) -> bool:
+        """The burst settled: apply AT MOST ONE correction, computed from
+        the NEWEST size (the user may have kept dragging during the
+        debounce, and correcting a stale box is how a window rubber-bands).
+        """
+        self._aspect_debounce_id = None
+        size, self._aspect_pending = self._aspect_pending, None
+        if size is None or self._closing:
+            return False
+        if not self._aspect_locked() or self._aspect_frozen():
+            return False
+        a = aspect.aspect_of(self.core.snapshot)
+        if not aspect.needs_correction(size[0], size[1], a):
+            return False
+        wa_w, wa_h = self._work_area()
+        fit = aspect.fit_aspect(size[0], size[1], a, max_w=wa_w, max_h=wa_h)
+        if fit == self._aspect_applied:
+            # We already asked for exactly this and the window system answered
+            # with something bigger (its own content minimum — the bottom bar
+            # is ~360 px wide).  That answer will not change, so asking again
+            # every burst would be a resize fight, and fights are how players
+            # die.
+            return False
+        self._apply_aspect_size(fit)
+        return False
+
+    def _apply_aspect_size(self, size: tuple[int, int]) -> None:
+        """set_default_size() is the ONE proven way to resize a mapped
+        Adw.ApplicationWindow on this build (Gtk.Window.resize() does not
+        exist).  The guard is armed BEFORE the call because the answer
+        arrives through the very signal we are reacting to."""
+        self._aspect_applying = True
+        self._aspect_applied = size
+        self._aspect_corrections += 1
+        self.set_default_size(size[0], size[1])
+        if self._aspect_guard_id is not None:
+            GLib.source_remove(self._aspect_guard_id)
+        self._aspect_guard_id = GLib.timeout_add(
+            aspect.APPLY_GUARD_MS, self._end_aspect_guard)
+
+    def _end_aspect_guard(self) -> bool:
+        """Our correction is on screen; whatever the compositor answered with
+        is the settled geometry now (recorded by the layout handler), so an
+        identical size can never look like a fresh drag."""
+        self._aspect_guard_id = None
+        self._aspect_applying = False
+        return False
+
+    def _aspect_forget(self) -> None:
+        """Drop everything in flight — no pending correction, no stale guard,
+        no remembered request.  'Off' has to mean FREE resizing immediately,
+        and a source we left armed could still move the window later."""
+        if self._aspect_debounce_id is not None:
+            GLib.source_remove(self._aspect_debounce_id)
+            self._aspect_debounce_id = None
+        if self._aspect_guard_id is not None:
+            GLib.source_remove(self._aspect_guard_id)
+            self._aspect_guard_id = None
+        self._aspect_pending = None
+        self._aspect_applying = False
+        self._aspect_applied = None
+
+    def _aspect_realign(self) -> None:
+        """Flipping the lock ON mid-playback adopts the shape the user has
+        the window in RIGHT NOW, corrected to the video's aspect.  The flip
+        itself is the request: no debounce, no burst rules here."""
+        if self._closing or not self._aspect_locked() or self._aspect_frozen():
+            return
+        size = self._aspect_size or START_SIZE
+        a = aspect.aspect_of(self.core.snapshot)
+        if not aspect.needs_correction(size[0], size[1], a):
+            return
+        self._aspect_applied = None               # fresh request, retry OK
+        wa_w, wa_h = self._work_area()
+        self._apply_aspect_size(aspect.fit_aspect(size[0], size[1], a,
+                                                  max_w=wa_w, max_h=wa_h))
+
+    def _aspect_on_file(self, left: int = 20) -> bool:
+        """§R8-B.4: a newly loaded video sizes the window to ITS aspect,
+        inside 80 % of the work area — 1080x1920 opens tall, 3840x2160 opens
+        wide.
+
+        Deferred and briefly polling because dwidth/dheight arrive with (or
+        after) file-loaded and R9 keeps synchronous mpv getters off the main
+        thread; the resume / AB / watchdog work in _on_file_loaded has long
+        finished by the first tick and is not touched by anything here.
+
+        A window whose shape is ALREADY the video's shape is not moved: a 16:9
+        window playing a 16:9 file stays exactly where the user put it, and an
+        unknown aspect (audio-only, idle) leaves the size alone entirely.
+        Anything that IS off-shape — a vertical clip opened in the 960x540
+        startup box — is fitted into the 80 % work-area box, which is the
+        brief's rule and the only honest answer for a window nobody has sized
+        yet."""
+        if self._closing:
+            self._aspect_file_id = None
+            return False
+        a = aspect.aspect_of(self.core.snapshot)
+        if a is None:
+            if left > 1:
+                self._aspect_file_id = GLib.timeout_add(
+                    100, self._aspect_on_file, left - 1)
+                return False
+            self._aspect_file_id = None
+            self._geom_consume()         # nothing to refit anyway (R10-B.1)
+            return False                 # audio-only / idle: leave it alone
+        self._aspect_file_id = None
+        self._aspect_applied = None      # new video: new aspect, retries OK
+        if self._geom_consume():
+            # R10-B.1: THIS window opened at a size CHOSEN FOR IT — the
+            # source window's exact pixel size or the remembered rect.  The
+            # round-8 initial fit is a NO-SHOW on the first file; the lock
+            # resumes for the next file and on any user resize meanwhile.
+            log.debug("aspect refit skipped: window opened with adopted "
+                      "geometry (R10-B.1)")
+            return False
+        if not self._aspect_locked() or self._aspect_frozen():
+            return False
+        w, h = self._aspect_size or START_SIZE
+        if not aspect.mismatch(w, h, a):
+            return False                 # already the right shape
+        wa_w, wa_h = self._work_area()
+        fit = aspect.fit_in_workarea(wa_w, wa_h, a)
+        if fit and fit != (w, h):
+            self._apply_aspect_size(fit)
+        return False
+
+    def _sync_aspect_action(self, on) -> None:
+        """Mirror the setting into the palette action (a settings row never
+        goes through the action, and the palette must show the truth).
+        lookup_action() returns None on this build (measured), hence the
+        stored reference from _build_actions."""
+        act = self._aspect_lock_action
+        if act is None:
+            return
+        on = bool(on)
+        if act.get_state().get_boolean() != on:
+            act.set_state(GLib.Variant("b", on))
+
+    def _act_aspect_lock(self, action, value) -> None:
+        """win.toggle-aspect-lock — the palette/accel surface for
+        ui.lock_aspect, STATEFUL so it also reports the current state.  The
+        settings row is the other writer of the same key; it lands in
+        on_setting_changed, which mirrors the state back here, so the two can
+        never disagree.
+
+        Off is total: _aspect_forget() clears the guard AND the pending
+        correction, so the very next drag is free."""
+        new = (value.get_boolean() if value is not None
+               else not action.get_state().get_boolean())
+        action.set_state(GLib.Variant("b", new))   # set_state: no re-emit
+        self.cfg.set("ui.lock_aspect", new)
+        if new:
+            self._aspect_realign()
+        else:
+            self._aspect_forget()
+        self.chrome.show_osd("aspect lock on" if new else "aspect lock off")
 
     # ---------------------------------------------------------------- actions
     def _build_actions(self) -> None:
@@ -945,6 +1515,23 @@ class ReelseeWindow(Adw.ApplicationWindow):
             act.connect("activate", lambda _a, _p, f=fn: f(None))
             group.add_action(act)
             self._actions[name] = fn
+        # R8-B: the aspect lock is STATEFUL — the palette surface (the "win"
+        # group this window enumerates) must be able to show what the setting
+        # says, in both directions, so a plain activate-callback is not
+        # enough.  Seeded from the setting, mirrored back on every change
+        # (see _sync_aspect_action); it is deliberately NOT in the `simple`
+        # dict, which builds parameterless stateless actions.
+        # parameter_type is deliberately None: with a boolean STATE and no
+        # parameter, GAction's own toggle convenience applies, so a bare
+        # `win.toggle-aspect-lock` activation flips it (measured: declaring a
+        # "b" parameter type makes GTK refuse the parameterless activation
+        # with g_simple_action_activate's assertion — a palette entry that
+        # cannot be activated is not a palette entry).
+        lock = make_aspect_lock_action(
+            bool(self.cfg.get("ui.lock_aspect", True)))
+        lock.connect("change-state", self._act_aspect_lock)
+        group.add_action(lock)
+        self._aspect_lock_action = lock
 
     # --------------------------------------------------- §7 T1 menu popovers
     @staticmethod
@@ -976,6 +1563,12 @@ class ReelseeWindow(Adw.ApplicationWindow):
     def _popover_of(self, child) -> Gtk.Popover:
         pop = Gtk.Popover()
         pop.set_child(child)
+        # R8-A: with the top menu bar deleted there is no launcher button
+        # — these popovers hang off the video area (same parent pattern as
+        # _ctx_pop) so the playlist/chapters/tracks row lists stay real,
+        # mapped widgets the snapshot keeps populated (and a popover open
+        # still holds the chrome revealed — same rule as the context menu).
+        pop.set_parent(self.view.area)
         # R5-A: an open popover must hold the chrome (and the headerbar)
         # revealed — retracting its anchor would strand the menu — and the
         # idle timer re-arms when it closes.
@@ -1017,16 +1610,10 @@ class ReelseeWindow(Adw.ApplicationWindow):
         pbox.append(bar)
         pbox.append(self._scrolled(self._pl_list))
         self._pl_pop = self._popover_of(pbox)
-        self.chrome.add_top_menu("playlist",
-                                 "Playlist  (b/n prev/next)"
-                                 ).set_popover(self._pl_pop)
         # ---- chapters (§7 chapter list + next/prev) ----
         self._ch_list = Gtk.ListBox()
         self._ch_list.connect("row-activated", self._activated)
         self._ch_pop = self._popover_of(self._scrolled(self._ch_list))
-        self.chrome.add_top_menu("chapters",
-                                 "Chapters  (PgUp/PgDn)"
-                                 ).set_popover(self._ch_pop)
         # ---- tracks (+ external files, §7) ----
         self._tr_list = Gtk.ListBox()
         self._tr_list.connect("row-activated", self._activated)
@@ -1043,9 +1630,6 @@ class ReelseeWindow(Adw.ApplicationWindow):
         tbox.append(tbar)
         tbox.append(self._scrolled(self._tr_list))
         self._tr_pop = self._popover_of(tbox)
-        self.chrome.add_top_menu("tracks",
-                                 "Audio / video / subtitle tracks"
-                                 ).set_popover(self._tr_pop)
 
     # -- popover content refresh (snapshot-driven; change-detected) --------
     def _pl_rows(self):
@@ -1169,11 +1753,32 @@ class ReelseeWindow(Adw.ApplicationWindow):
         # R6-A: the context-menu Repeat radio follows the SAME mpv loop
         # truth — raw "l"/"r" keys move the action state, and the popover
         # repaints its check mark from the action observer.
+        self._sync_repeat()
+
+    def _sync_repeat(self) -> None:
+        """R9-A: the single place an OBSERVED loop change becomes UI +
+        config state (called from the snapshot listener `_sync_menus`).
+
+        The native `l`/`r` keys (`_act_loop_file`/`_act_loop_playlist`)
+        keep mpv's own `cycle` semantics and never pass through
+        `_set_repeat_mode` — the snapshot is where EVERY loop-property
+        change lands (the main thread may not read a sync getter, R9),
+        so persisting HERE closes that hole for every current or future
+        path.  Config stores the canonical tri-state value via
+        `repeat_props`: an mpv count ("1", "2", …) IS "one"/"all" and
+        persists as "inf".  `_set_repeat_mode` pre-sets `_rep_mode`, so
+        its own changes never double-write here; an unrecognised stored
+        value maps to "off" (repeat_mode → _mpv_loop_on) and, being the
+        resting mode, rewrites NOTHING."""
         mode = chrome.repeat_mode(self.core.snapshot.get("loop-file"),
                                   self.core.snapshot.get("loop-playlist"))
-        if mode != self._rep_mode:
-            self._rep_mode = mode
-            self._ctx_repeat.set_state(GLib.Variant("s", mode))
+        if mode == self._rep_mode:
+            return
+        self._rep_mode = mode
+        self._ctx_repeat.set_state(GLib.Variant("s", mode))
+        loop_file, loop_playlist = chrome.repeat_props(mode)
+        self.cfg.set("playback.loop_file", loop_file)
+        self.cfg.set("playback.loop_playlist", loop_playlist)
 
     # ------------------------------------------------- playlist operations --
     def _pl_add_files(self) -> None:
@@ -1357,8 +1962,6 @@ class ReelseeWindow(Adw.ApplicationWindow):
                 self.chrome.state.timeout_ms = float(value)
             except (TypeError, ValueError):
                 pass
-        elif key == "ui.show_top_menu":
-            self._apply_top_menu_setting(bool(value))
         elif key == "engine.watchdog_enabled":
             self.watchdog.enabled = bool(value)
         elif key == "engine.watchdog_fps_floor_pct":
@@ -1371,6 +1974,19 @@ class ReelseeWindow(Adw.ApplicationWindow):
                 self.watchdog.drop_ceiling = float(value) / 100.0
             except (TypeError, ValueError):
                 pass
+        elif key == "ui.lock_aspect":            # R8-B (interface page)
+            self._sync_aspect_action(value)
+            if value:
+                self._aspect_realign()
+            else:
+                # "restore completely free resizing immediately": the guard
+                # and any queued correction go away with the setting.
+                self._aspect_forget()
+        elif key in ("ui.remember_geometry", "ui.cascade_offset_px"):
+            # R10-C: intentionally NO live plumbing — both are read fresh
+            # when the NEXT window opens (plan_open_geometry), which IS the
+            # specified "affects the next window without restarting".
+            pass
         elif key == "playback.video_off":          # §7 T1 audio-only mode
             self.core.set_property("vid", "no" if value else "auto")
         elif key == "video.scale_preset":          # §7 T1 scaler preset pack
@@ -1457,6 +2073,14 @@ class ReelseeWindow(Adw.ApplicationWindow):
         else:
             self.fullscreen()
             self._fs = True
+        # R8-B: the geometry of a fullscreen transition belongs to the
+        # transition, not to us — GTK hands back a whole storm of layout
+        # events on both edges, and correcting any of them is exactly how a
+        # window ends up at a size nobody asked for.  Settle first, then the
+        # normal rules apply again (the size we had before fullscreen is
+        # restored untouched, and if it is off-aspect the next drag fixes it).
+        self._aspect_forget()
+        self._aspect_free_until = time.monotonic() + 0.4
         # R5-D: draggability exists only while windowed (see _set_handle_active).
         self._set_handle_active(not self._fs)
         # R5-A: both edges re-arm the countdown — fullscreen retracts through
@@ -1471,6 +2095,11 @@ class ReelseeWindow(Adw.ApplicationWindow):
             self.unfullscreen()
             self._set_handle_active(True)         # R5-D: drag back on
             self._fs = False
+            # R8-B: the RESTORE storm is the dangerous edge — this is where a
+            # naive lock snaps a 1920x1080 window down to 450x800 because it
+            # still believes the pre-fullscreen size was the video's box.
+            self._aspect_forget()
+            self._aspect_free_until = time.monotonic() + 0.4
             self.chrome.wake()           # R5-A: restored chrome is revealed
             self._apply_reveal(True)
             self._update_title()
@@ -1493,10 +2122,18 @@ class ReelseeWindow(Adw.ApplicationWindow):
         self._set_repeat_mode(chrome.REPEAT_NEXT.get(mode, "off"))
 
     def _act_loop_file(self, _p=None) -> None:
+        """Native `l` semantics KEPT (mpv's own cycle: no → 1 → 2 → …;
+        smoke_repeat pins it).  R9-A: its PERSISTENCE is not here — every
+        property change lands in the snapshot, so _sync_repeat is the one
+        place that writes config for this path (no sync read allowed on
+        the main thread, R9 — a snapshot-based "cycle then persist" here
+        would have to race the async reply)."""
         self.core.command("cycle", "loop-file")
         self.chrome.show_osd("file loop: cycled (no → inf → N)")
 
     def _act_loop_playlist(self, _p=None) -> None:
+        """Native `r` semantics KEPT; persistence via _sync_repeat
+        (snapshot = the one landing point of every loop change)."""
         self.core.command("cycle", "loop-playlist")
         self.chrome.show_osd("playlist loop: cycled")
 

@@ -6,28 +6,6 @@ is rendered by an in-process OpenGL pipeline: libmpv draws frames into an
 FBO owned by a `GtkGLArea`, so decoding, GPU selection and every mpv option
 are first-class citizens of one small Python application.
 
-![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
-![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
-![GTK 4](https://img.shields.io/badge/GTK-4-E24E42)
-![libmpv 0.41](https://img.shields.io/badge/libmpv-0.41-579D35)
-![no subprocesses](https://img.shields.io/badge/mpv%20engine-embedded%20via%20libmpv-informational)
-
-
-## What it looks like
-
-| | |
-|---|---|
-| ![main window with chrome revealed](docs/screenshots/hero.png) | **Chrome revealed.** Title bar, menu strip, and the transport bar: play/pause, prev/next, `A`/`B` repeat points, position, seek, duration, repeat, speed, volume, mute — plus the live **GPU/CPU decode badge** at the right end. |
-| ![chrome retracted](docs/screenshots/clean.png) | **Chrome retracted.** A few seconds of pointer idle and every control — title bar included — fades out and the video owns the window. Move the mouse; it is back. Same idle behaviour as its sibling image viewer, Looksee. |
-| ![settings window](docs/screenshots/settings.png) | **Settings.** Seven pages (Playback, Audio, Video, **Decode & GPU**, Subtitles, Interface, Advanced mpv). Everything is applied live; *Advanced mpv* exposes any remaining raw libmpv option, searchable and persisted. |
-
-Images are generated from the app itself over the synthetic clips in
-`testdata/`, headless under Xvfb:
-`xvfb-run -a /usr/bin/python3 scripts/make_screenshots.py`. (The right-click
-menu has no screenshot on purpose — GTK dismisses popups on focus-out and
-Xvfb has no compositor, so a capture of it is not reproducible here.)
-
-
 ```
 /usr/bin/python3 src/reelsee.py <file|folder|URL> [...]
 ```
@@ -56,20 +34,21 @@ bracketed column tells where it lives.
 | Speed | 0.1–4.0, pitch-preserving (`audio-pitch-correction`) | `{`/`}` (Shift+`,`/`.`), settings slider, OSD presets |
 | Loop | loop-file (no → inf → N) and loop-playlist | `l`, `r`, ⟳ chrome button |
 | A/B | A/B section repeat + loop count (`ab-loop-count`), persisted per path | `[`, `]`, Shift+B / Backspace |
-| Chapters | chapter list popover + next/prev + OSD on change | chapters menu, Page_Up / Page_Dn |
-| Audio | track select (popover), external audio file, delay, device, exclusive mode | tracks menu, `a`, settings → Audio |
+| Chapters | chapter list popover + next/prev + OSD on change | right-click → Chapters, Page_Up / Page_Dn |
+| Audio | track select (popover), external audio file, delay, device, exclusive mode | right-click → Audio, `a`, settings → Audio |
 | Volume / mute | 0–130, persisted; per-window focus mute | ↑ ↓ / `m`, slider |
-| Video track | select / audio-only mode (`vid=no`) | tracks menu, settings → Playback |
-| Subtitles | track select, external `.srt/.ass…` file, delay, scale, visibility, styling preset (font / size / color / border / margin) | tracks menu, `v`, `t`, settings → Subtitles |
+| Video track | select / audio-only mode (`vid=no`) | right-click → Tracks, settings → Playback |
+| Subtitles | track select, external `.srt/.ass…` file, delay, scale, visibility, styling preset (font / size / color / border / margin) | right-click → Subtitles, `v`, `t`, settings → Subtitles |
 | Geometry | aspect override, zoom, pan-x/y, rotate, crop | settings → Video |
+| Aspect lock | **resize the window and it keeps the video's own aspect** — landscape and portrait both work (GTK4 has no geometry hints, so it corrects from `Gdk.Surface::layout`) | `ui.lock_aspect`, palette `win.toggle-aspect-lock`, settings → Interface |
 | Equalizer | brightness / contrast / saturation / gamma / hue | settings → Video |
 | Quality | scale presets (default/fast/high/higher → `scale/cscale/dscale`), deband, dither depth, interpolation, tscale | settings → Video |
 | Deinterlace | auto / yes / no | settings → Video |
 | Screenshots | png/jpg + directory + quality; optional clipboard copy | `s`, settings → Interface |
-| Window | fullscreen (F11), leave-Fullscreen (Esc), always-on-top, custom title format (`${media-title}` / `${filename}`) | `f`, Esc, settings → Interface |
+| Window | fullscreen (F11), leave-Fullscreen (Esc), always-on-top, custom title format (`${media-title}` / `${filename}`); last window size & position remembered across launches (`ui.remember_geometry`, never a fullscreen rect); new windows cascade beside the current one at its exact size (`ui.cascade_offset_px`, flips at the screen edge, 0 = exactly on top) — positioning is an X11 capability, so on Wayland the packaged `.desktop` pins `GDK_BACKEND=x11` (environment-overridable) and native Wayland degrades to size-only cascades | `f`, Esc, settings → Interface |
 | Resume | resume position per file in **our** `resume.json` (never mpv's `--resume-playback`) | automatic (`playback.resume`, `resume_min_s`) |
 | Decode | hardware decode + GPU pin + CPU decode + overload watchdog (auto drop to `hwdec=no`) | settings → Advanced; auto round-robin across GPUs |
-| Playlist | add file/folder, remove, reorder, shuffle, save/load `.m3u`, next/prev, natural sort, folder live-refresh | playlist menu, `n` / `b` |
+| Playlist | add file/folder, remove, reorder, shuffle, save/load `.m3u`, next/prev, natural sort, folder live-refresh | right-click → Playlist, `n` / `b` |
 | URLs | network playback, yt-dlp expansion when `yt-dlp` is on `PATH` (falls back to the raw URL) | just pass a URL |
 | Audio-only / cover art | `vid=no`, `cover-art-auto` | settings → Playback |
 | OSD | transient OSD on keyboard seek, track change, chapter change (mpv `osd-level=0`) | automatic |
@@ -83,7 +62,7 @@ under `mpv.options` in `config.json`.
 
 | Feature | Engine hook | Tier |
 |---|---|---|
-| Lua/JS scripting, `load-script`, `--script-opts` | — | refused (see blocklist) |
+| Lua/JS scripting, `load-script`, `--script-opts` | — | T3 (R12 blocklist) |
 | VapourSynth (`--vf=vapoursynth`) | — | T3 (needs the runtime; not installed) |
 | DVD/BluRay/DVB navigation UI | — | T3 |
 | `--wid` embedding, macOS/Windows backends, `tct`/terminal output | — | T3 |
@@ -115,7 +94,7 @@ mpv commands. Canonical source: `src/keymap.py`.
 | `s` | screenshot |
 | `a` | cycle audio track |
 | `v` | cycle subtitle track; `t` toggles subtitle visibility |
-| `l` | cycle loop-file (no → inf → N) |
+| `l` | cycle loop-file (no → inf → N); the choice persists across reloads and restarts |
 | `r` | cycle loop-playlist |
 | `{` / `}` | speed down / up (0.1–4.0) |
 | `n` / `b` | playlist next / previous |
@@ -229,26 +208,27 @@ roundtrip).
 /usr/bin/python3 -m unittest discover tests
 ```
 
-292 tests, no display required (3 skip when their optional dependency is
-absent). Behaviour that only exists with a real player is covered by the
-headless smokes and the acceptance battery described in
-[ARCHITECTURE.md](ARCHITECTURE.md) — gates carry negative controls so they
-cannot pass by doing nothing.
+387 unit tests (no display) behind a 35-gate headless battery that is run
+twice consecutively before a release. Behaviour that only exists with a real
+player is covered by the headless smokes and the acceptance battery described
+in [ARCHITECTURE.md](ARCHITECTURE.md) — every gate carries a negative control
+so it cannot pass by doing nothing, and gates are run repeatedly because two
+of them (a config-read race, a shared state directory) once produced false
+results that looked like success.
 
-## Status and roadmap
+## Status
 
-This snapshot is the feature set described above, verified as shipped.
-In flight on top of it, in order:
+Shipped and gated: embedded-render playback, per-GPU decode pinning with
+engagement verification and the CPU-fallback watchdog, A/B section repeat,
+mute/volume/resume persistence, the deleted top bar with media menus on
+right-click, aspect-locked resize, remembered geometry with exact-size
+cascading, and repeat that survives reload/restart. See
+[CHANGELOG.md](CHANGELOG.md).
 
-* aspect-ratio-locked window resize (works for landscape *and* portrait
-  sources; GTK4 has no geometry hints, so it is done from
-  `Gdk.Surface::layout`)
-* window geometry memory — a new window opens at the last window's size and
-  position with a ±50 px cascade offset
-* a fix for the repeat mode not surviving a reload of the same file
-* **crop to window** — fill the window and hide the overflow, so a landscape
-  video in a portrait window loses its sides instead of getting bars
+Next up: **crop to window** — fill the window and hide the overflow, so a
+landscape video in a portrait window loses its sides instead of getting bars.
 
 Design rationale, requirement ids and the appendix proofs:
-[docs/DESIGN.md](docs/DESIGN.md). Agent/contributor constraints:
-[AGENTS.md](AGENTS.md), [CONTRIBUTING.md](CONTRIBUTING.md).
+[docs/DESIGN.md](docs/DESIGN.md). Constraints for coding agents:
+[AGENTS.md](AGENTS.md). Environment and workflow:
+[CONTRIBUTING.md](CONTRIBUTING.md).

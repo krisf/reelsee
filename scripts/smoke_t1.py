@@ -214,17 +214,26 @@ def probe_schedule(app):
                           not in (None, "")), guard(t8))
 
     def t8():
-        # menu-button popovers exist + are populated
+        # R8-A tree: NO top bar / MenuButtons exist any more — the
+        # playlist/chapters/tracks lists live in snapshot-fed popovers
+        # parented to the video area, and the same features are entries of
+        # the right-click menu model.
         w = win()
-        menus = []
-        child = w.chrome.top.get_first_child()
-        while child is not None:
-            if isinstance(child, Gtk.MenuButton):
-                menus.append(child)
-            child = child.get_next_sibling()
-        check("popover_menubuttons", len(menus) == 3, f"n={len(menus)}")
-        check("popovers_attached",
-              all(m.get_popover() is not None for m in menus), "ok")
+
+        def no_menubutton(node):
+            if isinstance(node, Gtk.MenuButton):
+                return False
+            c = node.get_first_child()
+            while c is not None:
+                if not no_menubutton(c):
+                    return False
+                c = c.get_next_sibling()
+            return True
+
+        check("no_top_bar_menubuttons", no_menubutton(w), "tree walk")
+        check("popovers_wired",
+              all(p is not None and p.get_parent() is not None
+                  for p in (w._pl_pop, w._ch_pop, w._tr_pop)), "ok")
         GLib.timeout_add(200, guard(t9))
 
     def nrows(lb):

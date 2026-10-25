@@ -64,6 +64,18 @@ spike that proves the render path is kept at
   resize is done by handling `Gdk.Surface::layout` and calling
   `set_default_size()` on the mapped window; positioning a window toplev
   requires the X11 backend (and is impossible on Wayland by protocol).
+* Aspect-ratio correction fires from `Gdk.Surface::layout`, which also
+  fires for **your own** resize. Without a re-entrancy guard, one
+  correction per layout burst and a debounce, a drag storm ensues; the
+  gate drives synthetic `(surface,w,h)` feeds precisely so this is
+  testable headlessly.
+* Remembered window geometry is **shared state**. Two smokes reusing one
+  state directory inherit each other's rect and produce results that look
+  like correctness (`R10-fix` purges `window.json` per invocation). Give
+  every phase its own `REELSEE_STATE_DIR`.
+* Window *placement* is not a GTK4 capability. On X11 it is a raw Xlib
+  `MoveResizeWindow`; on Wayland it is impossible by protocol, so tests
+  must assert size-exactness and treat the offset as best-effort.
 * Chrome visibility is a state machine (`src/chrome.py::ChromeState`), not a
   timer in the widget: hidden **only** while playing; pause, stop, EOF and
   any pointer motion show it again. Drive it with a monotonic clock so
@@ -95,9 +107,11 @@ scripts/p11_battery.sh                             # the full acceptance battery
 
 ## Layout
 
-Pure (unit-testable, no `gi`): `ab.py`, `chrome.py::ChromeState`,
-`config.py`, `ctxmenu.py` (model half only), `engine.py`, `keymap.py`,
-`registry.py`, `reelsee_io.py`, `watchdog.py`.
+Pure (unit-testable, no `gi`): `ab.py`, `aspect.py` (`fit_aspect`),
+`chrome.py::ChromeState`, `config.py`, `ctxmenu.py` (model half only),
+`engine.py`, `keymap.py`, `registry.py`, `reelsee_io.py`, `watchdog.py`,
+`wingeom.py` (remembered rect + cascade arithmetic). `x11pos.py` is the thin
+raw-Xlib placement shim — X11 only, and it must degrade quietly.
 Impure: `mpvlib.py` (ctypes), `mpvcore.py` (handle + event thread),
 `render.py` (GLArea), `window.py` (chrome, gestures, transport),
 `settings_ui.py`, `reelsee.py` (entry point).

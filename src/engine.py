@@ -63,6 +63,22 @@ def fixed_init_options() -> dict[str, str]:
     }
 
 
+def valid_loop_value(value) -> str | None:
+    """R9-A gate for feeding a stored config loop value to mpv as an
+    init OPTION: only values mpv itself speaks — "inf"/"force" or a
+    non-negative integer string.  "no"/empty/None/anything unrecognised
+    → None: the property simply keeps its mpv default ("no" → the icon
+    derives "off") and the stored value stays untouched in config."""
+    s = "" if value is None else str(value).strip()
+    if s in ("inf", "force"):
+        return s
+    try:
+        n = int(s)
+    except ValueError:
+        return None
+    return s if n >= 0 else None
+
+
 def mpv_init_options(cfg, headless: bool, n_windows: int = 1,
                      sysroot: str = "/sys", devroot: str = "/dev",
                      engines: "list[Engine] | None" = None,
@@ -79,6 +95,17 @@ def mpv_init_options(cfg, headless: bool, n_windows: int = 1,
     opts.update(mpv_options(sel, cfg, n_windows, sysroot, devroot))
     if bool(cfg.get("playback.keep_open", True)):
         opts["keep-open"] = "yes"
+    # R9-A: a persisted repeat choice is the core's BEGINNING state, not
+    # a post-load patch — seeding it as an init option makes the FIRST
+    # observed loop-file/loop-playlist value match the seeded bottom-bar
+    # glyph and radio (no flicker to "off" at startup, same contract as
+    # mute), and the pre-load PROPERTY_MAP push simply agrees with it.
+    # Unrecognised stored values are skipped (property stays "no").
+    for _key, _opt in (("playback.loop_file", "loop-file"),
+                       ("playback.loop_playlist", "loop-playlist")):
+        _val = valid_loop_value(cfg.get(_key))
+        if _val is not None:
+            opts[_opt] = _val
     if headless:                            # R13: never touch real hw in CI
         opts["hwdec"] = "no"
         opts["ao"] = "null"

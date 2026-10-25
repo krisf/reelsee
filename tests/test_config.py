@@ -66,6 +66,37 @@ class TestUnknownKeys(TmpDirCase):
         self.assertEqual(raw["audio"]["volume"], 55.0)
 
 
+class TestTopMenuKeyMigration(TmpDirCase):
+    """R8-A: ui.show_top_menu was DELETED together with the in-video top
+    menu bar.  Old configs carrying the dead key must still load cleanly
+    (deep_merge preserves unknown keys; NOTHING reads the key any more —
+    no exception, no traceback, no warning), and nothing may still
+    reference it: no DEFAULTS entry, no schema leaf, no settings binding."""
+
+    DEAD = {"ui": {"show_top_menu": False}}
+
+    def test_old_config_with_dead_key_loads_cleanly(self):
+        self.path.write_text(json.dumps(self.DEAD))
+        cfg = config.Config(self.path)      # must not raise / warn
+        self.assertEqual(cfg.get("ui.chrome_timeout_ms"), 3000)  # merged
+        self.assertEqual(cfg.get("ui.theme"), "black")
+
+    def test_dead_key_preserved_but_inert_on_roundtrip(self):
+        self.path.write_text(json.dumps(self.DEAD))
+        cfg = config.Config(self.path)
+        cfg.set("ui.osd_ms", 1500)
+        cfg.flush_now()
+        back = json.loads(self.path.read_text())
+        self.assertEqual(back["ui"]["show_top_menu"], False)  # kept, inert
+        self.assertEqual(back["ui"]["osd_ms"], 1500)
+
+    def test_dead_key_gone_from_schema_defaults_bindings(self):
+        import settings_ui
+        self.assertNotIn("show_top_menu", config.DEFAULTS["ui"])
+        self.assertNotIn("ui.show_top_menu", config.schema_leaf_keys())
+        self.assertNotIn("ui.show_top_menu", settings_ui.binding_keys())
+
+
 class TestAtomicWrite(TmpDirCase):
     def test_uses_replace_and_leaves_no_tmp(self):
         calls = []

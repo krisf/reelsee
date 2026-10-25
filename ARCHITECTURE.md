@@ -82,6 +82,26 @@ OLED-black monochrome theme. Top bar, bottom transport bar and the window
 controls fade as one unit; the video surface is a `GtkWindowHandle`, so the
 window can be dragged from the picture itself.
 
+## Window geometry
+
+Two independent mechanisms, both pure-tested before they touch a widget:
+
+* **Aspect lock** — the resize keeps the video's own aspect ratio, landscape
+  and portrait alike. GTK4 has no `set_geometry_hints`, so the correction is
+  computed by `aspect.fit_aspect()` from the observed `dwidth`/`dheight` and
+  applied on `Gdk.Surface::layout` via `set_default_size()` on the mapped
+  window. A re-entrancy guard plus one correction per layout burst and an
+  ~80 ms debounce keep a fast drag from storming; fullscreen, maximized and
+  unknown-aspect states leave resizing completely free. A newly loaded video
+  fits its own aspect inside 80 % of the work area.
+* **Remembered geometry and cascading** — the last windowed rect is stored
+  (debounced 250 ms, flushed on close/quit, never a fullscreen rect) and a new
+  window opens at *exactly* that size, offset ±50 px with the direction chosen
+  by available space. GTK4 cannot move a window, so placement goes through raw
+  Xlib; the packaged launcher pins `GDK_BACKEND=x11` (environment-overridable)
+  and native Wayland degrades to size-only cascading, which is the honest
+  ceiling of `xdg-shell`.
+
 ## Persistence
 
 | Path | Contents | Discipline |

@@ -186,10 +186,23 @@ def main() -> int:
     cp.optionxform = str            # desktop keys are case-sensitive (Name, Exec)
     cp.read("data/pro.krisforbes.Reelsee.desktop", encoding="utf-8")
     de = dict(cp["Desktop Entry"])
+    # R10-C (sanctioned gate change): the packaged launcher must pin
+    # GDK_BACKEND=x11 — window POSITIONING is X11-only — but environment-
+    # overridable (${GDK_BACKEND:-x11}, the limusic technique plus the
+    # override its plain `env` form lacks).  The single-quote shell form
+    # is MEASURED to be the only escaping that survives the real loader:
+    # Gio.DesktopAppInfo refuses to even parse the desktop-spec \" form
+    # (app would vanish from GNOME); see DSH-REPORT-R10.md §C.  Old
+    # assertion (Exec == "reelsee %U") predates R10; %U must stay a bare
+    # field code at the end.
+    r10_exec = (de["Exec"].startswith("sh -c '")
+                and '${GDK_BACKEND:-x11}' in de["Exec"]
+                and 'exec reelsee "$@"' in de["Exec"]
+                and de["Exec"].endswith('\' reelsee %U'))
     check("desktop_entry",
           all(de.get(k) for k in ("Type", "Name", "GenericName", "Exec",
                                   "Icon", "MimeType"))
-          and de["Exec"] == "reelsee %U"
+          and r10_exec
           and de["Type"] == "Application"
           and de["Terminal"] == "false"
           and "video/mp4" in de["MimeType"]

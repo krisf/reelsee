@@ -112,7 +112,11 @@ def main() -> int:
                     c = c.get_next_sibling()
                 return out
 
-            tops = [t for t in labels(w.chrome.top) if "loop" in t.lower()]
+            # R8-A: no top bar exists at all any more — the whole-window
+            # scan is the stronger form of the old "no loop button in the
+            # top bar" check: NOTHING anywhere may be a text-labelled
+            # loop/Repeat button (the repeat control is the bottom icon).
+            tops = [t for t in labels(w) if "loop" in t.lower()]
             check("no_loop_button_in_top_bar", not tops, repr(tops))
             check("no_btn_loop_attr", not hasattr(w.chrome, "btn_loop"),
                   "attr gone")
