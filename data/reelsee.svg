@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#242428"/>
+      <stop offset="1" stop-color="#101014"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="24" fill="url(#bg)"
+        stroke="#3a3a42" stroke-width="2"/>
+  <!-- film strip sprockets -->
+  <g fill="#3f3f48">
+    <rect x="16" y="18" width="10" height="8" rx="2"/>
+    <rect x="16" y="102" width="10" height="8" rx="2"/>
+    <rect x="102" y="18" width="10" height="8" rx="2"/>
+    <rect x="102" y="102" width="10" height="8" rx="2"/>
+  </g>
+  <!-- play triangle -->
+  <path d="M50 38 L92 64 L50 90 Z" fill="#33d17a"/>
+  <!-- seek tick accents -->
+  <rect x="34" y="108" width="60" height="4" rx="2" fill="#5a5a64"/>
+  <circle cx="58" cy="110" r="5" fill="#33d17a"/>
+</svg>

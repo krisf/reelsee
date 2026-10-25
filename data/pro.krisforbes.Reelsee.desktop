@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Reelsee
+GenericName=Video Player
+Comment=GTK4/libmpv video player with GPU-aware decoding
+Exec=reelsee %U
+Icon=reelsee
+Terminal=false
+Categories=AudioVideo;Player;Video;
+MimeType=video/mp4;video/x-matroska;video/webm;video/x-msvideo;video/quicktime;video/mpeg;video/ogg;video/x-ms-wmv;
+X-Reelsee-Version=1

@@ -1,0 +1,12 @@
+Package: reelsee
+Version: 0.1.0
+Architecture: all
+Section: video
+Priority: optional
+Depends: python3 (>= 3.10), python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1, libadwaita-1-0, libmpv2
+Maintainer: Kris Forbes <krisf@users.noreply.github.com>
+Description: GTK4/libmpv video player
+ Reelsee is a keyboard-first video player built on GTK4, libadwaita and
+ vendored libmpv 0.41: GPU-aware engine selection (VAAPI/Vulkan round-robin),
+ an overload watchdog with automatic decoder demotion, multi-window with
+ focus-audio policy, A/B loops, and async folder playlists.
