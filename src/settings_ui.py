@@ -86,6 +86,8 @@ BINDINGS: tuple[dict, ...] = (
          digits=0),
     dict(key="video.crop", page="video", kind="entry",
          label="Crop (WxH+X+Y, empty = off)"),
+    dict(key="video.crop_to_window", page="video", kind="switch",
+         label="Crop to window (fill, clip overflow)"),
     dict(key="video.brightness", page="video", kind="scale",
          label="Brightness", minimum=-100, maximum=100, step=1, digits=0),
     dict(key="video.contrast", page="video", kind="scale",

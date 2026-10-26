@@ -1,24 +1,31 @@
 #!/usr/bin/python3
-"""R5-A gate smoke: the ENTIRE chrome — real titlebar included — retracts.
+"""R12 contract: the ENTIRE chrome — top strip with the window controls
+included — fades away OVER the video and fades back, with zero layout
+movement.
 
-Drives the reveal mechanism of a real Adw.ApplicationWindow + Adw.ToolbarView
-through the same ChromeState timeline as smoke_chrome (ui.chrome_timeout_ms
-=400).  Checks the brief's transition sequence:
+The old version of this gate drove Adw.ToolbarView's reveal_top_bars and
+proved the header unmaps and the video grows into the freed space.  That
+mechanism is GONE (round 12: the chrome is a Gtk.Overlay layer; retracting
+must not resize the video by a single pixel).  Rewritten to the new
+contract — strictly STRONGER where it counts:
 
-  start revealed -> playing+idle retracts -> motion reveals -> paused stays
-  -> popover open holds revealed (no stranded menus) -> close re-arms ->
-  fullscreen retracts identically -> leaving fullscreen restores revealed.
-
-Also captures the report's screenshot pair (titlebar present, then absent,
-video playing) and proves min/max/close buttons are INSIDE the retracting
-Adw.HeaderBar (they vanish with it), never a separate WM decoration.
+  * "revealed/retracted" are the widget OPACITIES of BOTH chrome groups
+    (bottom bar AND top strip), i.e. the whole chrome including min/max/
+    close fades — nothing outside the fade set may stay painted;
+  * the video allocation is asserted BYTE-IDENTICAL across every
+    transition (the old smoke asserted the opposite: growth);
+  * the pixel pair is kept: the top strip reads as dark chrome while
+    revealed and as live VIDEO at the same screen coordinates once
+    retracted;
+  * popover-open blocks retraction; popover-close re-arms the countdown;
+  * fullscreen retracts identically, leaving fullscreen restores.
 """
 import json
 import os
 import subprocess
 import sys
 
-from smoke_harness import SCRATCH, check, finish, image_colors, image_mean
+from smoke_harness import SCRATCH, check, finish, image_mean
 
 CFG = SCRATCH / "adwchrome-cfg"
 CFG.mkdir(parents=True, exist_ok=True)
@@ -32,25 +39,36 @@ state: dict = {}
 SHOTS = SCRATCH / "r5a"
 SHOTS.mkdir(parents=True, exist_ok=True)
 
-HDR_STRIP = "900x40+30+4"          # inside the header, away from corners
-TOP_STRIP = "900x40+30+4"          # same geometry once the video owns it
+HDR_STRIP = "900x40+30+4"          # inside the top strip, away from corners
+TOP_STRIP = "900x40+30+4"          # same screen coordinates once faded
 VIDEO_MID = "640x200+160+260"      # solidly inside the video frame
 
 
-def image_std(xwd, crop: str) -> float:
-    out = subprocess.run(
-        ["convert", str(xwd), "-crop", crop, "+repage", "-colorspace",
-         "gray", "-format", "%[fx:standard_deviation*255]", "info:"],
-        capture_output=True, text=True)
-    try:
-        return float(out.stdout.strip())
-    except ValueError:
-        return -1.0
+def fades(win):
+    """THE mechanism's state (not a hand-rolled proxy): opacity of BOTH
+    reveal groups — the bottom bar and the R12 top strip."""
+    return (round(float(win.chrome.bottom.get_opacity()), 3),
+            round(float(win.top_bar.get_opacity()), 3))
 
 
-def reveal(win) -> bool:
-    """THE mechanism's current state (not a hand-rolled proxy)."""
-    return win._toolbar.get_reveal_top_bars()
+def revealed(win):
+    a, b = fades(win)
+    return a > 0.95 and b > 0.95
+
+
+def retracted(win):
+    a, b = fades(win)
+    return a < 0.05 and b < 0.05
+
+
+def targets(win):
+    return (bool(win.chrome.bottom.get_can_target()),
+            bool(win.top_bar.get_can_target()))
+
+
+def video_alloc(win):
+    a = win.view.area
+    return (a.get_width(), a.get_height())
 
 
 def shot(name: str, crop: str = VIDEO_MID, tries: int = 10):
@@ -74,181 +92,8 @@ def playing(win) -> bool:
             and (snap.get("time-pos") or 0) > 0.05)
 
 
-def probe_schedule(app):
-    from gi.repository import GLib
-    state["app"] = app
-
-    def win():
-        return app.windows[0]
-
-    def again(fn, ms):
-        GLib.timeout_add(ms, fn)
-        return False
-
-    def s0():
-        # R5 restructure: the reveal-at-start and header-structure checks
-        # used to ride the first "playing" poll — with a slow engine cold
-        # start the 400 ms idle retraction fires BEFORE playing is first
-        # observed, and the check raced.  Assert the startup state the
-        # MOMENT the window exists (reveal is structurally true until the
-        # first countdown completes, 400 ms later), then gate on playing.
-        if not app.windows:
-            return again(s0, 40)
-        w = win()
-        check("reveal_starts_revealed", reveal(w), str(reveal(w)))
-        kinds = set()
-        for name in ("window-minimize-symbolic", "window-maximize-symbolic",
-                     "window-close-symbolic"):
-            if _header_has_icon(w, name):
-                kinds.add(name)
-        check("headerbar_owns_window_controls", len(kinds) >= 2,
-              ",".join(sorted(x.split("-")[1] for x in kinds)))
-        return again(s0b, 20)
-
-    def s0b():
-        # wait until actually playing (engine cold start is variable)
-        if not playing(win()) and state.get("plays", 0) < 60:
-            state["plays"] = state.get("plays", 0) + 1
-            return again(s0b, 200)
-        check("playing_for_timeline", playing(win()), "played")
-        return again(wait_title, 20)
-
-    def wait_title(left=25):
-        # the title repaint rides the file-loaded observed callback and
-        # can land a hair AFTER the first "playing" snapshot (R5: extra
-        # observed props shifted event interleaving) — poll for it;
-        # delaying the chain from here is harmless (s1/s1b tolerate it).
-        if "perf_1080p30" in win()._title_label.get_text() or left <= 0:
-            return again(rest, 20)
-        return again(lambda: wait_title(left - 1), 150)
-
-    def rest():
-        w = win()
-        check("title_shows_filename",
-              "perf_1080p30" in w._title_label.get_text(),
-              w._title_label.get_text())
-        w.chrome.motion(400, 300, 960, 540)   # wake: header on screen
-        return again(after_wake, 200)
-
-    def after_wake():
-        shot("01-titlebar-present")
-        m1 = image_mean(SHOTS / "01-titlebar-present.xwd", HDR_STRIP)
-        check("titlebar_strip_present", 0 <= m1 <= 12, str(round(m1, 2)))
-        return again(s1, 650)          # 650 > 400 idle, playing
-
-    def s1():
-        w = win()
-        check("playing_idle_retracts_header", not reveal(w),
-              f"reveal={reveal(w)}")
-        return again(s1b, 350)             # let the reveal animation settle
-
-    def s1b():
-        w = win()
-        check("header_unmapped_after_anim", not w.header.get_mapped(),
-              str(w.header.get_mapped()))
-        # content grew into the freed space: overlay now fills the window
-        ov_h, wh = w.overlay.get_height(), w.get_height()
-        check("video_fills_window_when_retracted",
-              abs(ov_h - wh) <= 2 and _at_top(w), f"h={ov_h}/{wh}")
-        shot("02-titlebar-gone", crop=TOP_STRIP)
-        m2 = image_mean(SHOTS / "02-titlebar-gone.xwd", TOP_STRIP)
-        m = image_mean(SHOTS / "02-titlebar-gone.xwd", VIDEO_MID)
-        check("same_strip_now_video", m2 > 25, str(round(m2, 2)))
-        check("video_still_playing", m > 8, str(m))
-        w.chrome.motion(400, 300, 960, 540)      # wake seam, as the pointer
-        return again(s2, 150)
-
-    def s2():
-        w = win()
-        check("motion_reveals_header", reveal(w) and w.header.get_mapped(),
-              str(reveal(w)))
-        w._actions["play-pause"](None)           # pause
-        state["pause_tries"] = 0
-        return again(s3, 250)
-
-    def s3():
-        w = win()
-        paused = w.core.snapshot.get("pause") is True
-        if (not paused or not reveal(w)) and state.get("pause_tries", 0) < 12:
-            state["pause_tries"] += 1
-            return again(s3, 250)
-        check("paused_keeps_header_revealed", paused and reveal(w),
-              f"pause={paused} reveal={reveal(w)}")
-        # back to playing; wait for the idle retraction, THEN open a menu
-        w._actions["play-pause"](None)
-        state["idle_tries"] = 0
-        return again(s4, 650)
-
-    def s4():
-        w = win()
-        if reveal(w) and state.get("idle_tries", 0) < 12:
-            state["idle_tries"] += 1
-            return again(s4, 250)              # still playing+paused flip lag
-        check("replaying_retracts_again", not reveal(w), str(reveal(w)))
-        w.chrome.motion(400, 300, 960, 540)     # user wakes, then opens menu
-        return again(s5, 120)
-
-    def s5():
-        w = win()
-        w._pl_pop.popup()                       # real popover open
-        return again(s6, 900)                   # 900 >> 400: hold required
-
-    def s6():
-        w = win()
-        held = reveal(w) and w._pl_pop.get_visible()
-        check("popover_open_blocks_retraction", held,
-              f"reveal={reveal(w)} pop={w._pl_pop.get_visible()}")
-        w._pl_pop.popdown()
-        return again(s7, 200)
-
-    def s7():
-        w = win()
-        check("popover_close_reveals", reveal(w), str(reveal(w)))
-        state["rearm"] = 0
-        return again(s8, 650)                   # re-armed countdown expires
-
-    def s8():
-        w = win()
-        check("retract_after_rearm", not reveal(w), str(reveal(w)))
-        w._actions["fullscreen"](None)
-        return again(s9, 150)
-
-    def s9():
-        w = win()
-        check("fullscreen_restores_revealed",
-              w._act_fullscreen_state() and reveal(w),
-              f"fs={w._act_fullscreen_state()} reveal={reveal(w)}")
-        state["fs_tries"] = 0
-        return again(s10, 650)
-
-    def s10():
-        w = win()
-        if reveal(w) and state.get("fs_tries", 0) < 8:
-            state["fs_tries"] += 1
-            return again(s10, 250)
-        check("fullscreen_retracts_identically",
-              w._act_fullscreen_state() and not reveal(w),
-              f"fs={w._act_fullscreen_state()} reveal={reveal(w)}")
-        w._actions["fullscreen"](None)          # leave fullscreen
-        return again(s11, 150)
-
-    def s11():
-        w = win()
-        check("leaving_fullscreen_restores",
-              (not w._act_fullscreen_state()) and reveal(w),
-              f"fs={w._act_fullscreen_state()} reveal={reveal(w)}")
-        check("shots_captured",
-              (SHOTS / "01-titlebar-present.png").exists()
-              and (SHOTS / "02-titlebar-gone.png").exists(), str(SHOTS))
-        app.quit()
-        return False
-
-    GLib.timeout_add(50, s0)
-    return False
-
-
-def _header_has_icon(win, icon_name: str) -> bool:
-    """Walk the headerbar subtree for a widget carrying that icon name."""
+def _strip_has_icon(win, icon_name: str) -> bool:
+    """Walk the RETRACTING top strip's subtree for that icon name."""
     from gi.repository import Gtk
 
     def walk(w):
@@ -260,14 +105,232 @@ def _header_has_icon(win, icon_name: str) -> bool:
                 return True
             child = child.get_next_sibling()
         return False
-    return walk(win.header)
+    return walk(win.top_bar)
 
 
-def _at_top(win) -> bool:
-    """Overlay's top edge sits at the window's top (header space reclaimed)."""
-    from gi.repository import Graphene
-    ok, pt = win.overlay.compute_point(win, Graphene.Point())
-    return bool(ok) and abs(pt.y) < 2
+def probe_schedule(app):
+    from gi.repository import GLib
+    state["app"] = app
+
+    def win():
+        return app.windows[0]
+
+    def guard(fn):
+        def run(*a):
+            try:
+                return fn(*a)
+            except Exception as exc:               # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                check(fn.__name__ + "_crashed", False, repr(exc))
+                app.quit()
+                return False
+        run.__name__ = fn.__name__
+        return run
+
+    def again(fn, ms):
+        GLib.timeout_add(ms, fn)
+        return False
+
+    def s0():
+        # Startup: the chrome is structurally revealed until the first
+        # countdown completes (400 ms after "playing" is first observed).
+        if not app.windows:
+            return again(s0, 40)
+        w = win()
+        check("reveal_starts_revealed", revealed(w), str(fades(w)))
+        kinds = set()
+        for name in ("window-minimize-symbolic", "window-maximize-symbolic",
+                     "window-close-symbolic"):
+            if _strip_has_icon(w, name):
+                kinds.add(name)
+        check("controls_inside_retracting_strip", len(kinds) >= 2,
+              ",".join(sorted(x.split("-")[1] for x in kinds)))
+        check("controls_clickable_while_revealed",
+              targets(w) == (True, True), str(targets(w)))
+        return again(s0b, 20)
+
+    def s0b():
+        # wait until actually playing (engine cold start is variable)
+        if not playing(win()) and state.get("plays", 0) < 60:
+            state["plays"] = state.get("plays", 0) + 1
+            return again(s0b, 200)
+        check("playing_for_timeline", playing(win()), "played")
+        return again(wait_title, 20)
+
+    def wait_title(left=25):
+        # the title repaint rides the file-loaded callback and can land a
+        # hair AFTER the first "playing" snapshot — poll for it.
+        if "perf_1080p30" in win()._title_label.get_text() or left <= 0:
+            return again(rest, 20)
+        return again(lambda: wait_title(left - 1), 150)
+
+    def shot_video(name: str, crop: str, tries: int = 12):
+        """Capture until the VIDEO region is genuinely painted, so the
+        strip reading at `crop` compares like-for-like (an unpainted
+        black GL area would fake a "dark chrome" mean)."""
+        from smoke_harness import capture_xwd
+        path = SHOTS / f"{name}.xwd"
+        for _ in range(tries):
+            if not capture_xwd(path):
+                continue
+            subprocess.run(["convert", str(path), str(path.with_suffix(".png"))],
+                           capture_output=True)
+            if image_mean(path, VIDEO_MID) > 8:
+                return path
+        return path
+
+    def rest():
+        w = win()
+        check("title_shows_filename",
+              "perf_1080p30" in w._title_label.get_text(),
+              w._title_label.get_text())
+        w.chrome.motion(400, 300, 960, 540)   # wake: chrome on screen
+        return again(after_wake, 250)
+
+    def after_wake():
+        w = win()
+        state["alloc_revealed"] = video_alloc(w)
+        state["surface_revealed"] = (w.get_surface().get_width(),
+                                     w.get_surface().get_height())
+        p = shot_video("01-titlebar-present", HDR_STRIP)
+        m1 = image_mean(p, HDR_STRIP)
+        # The strip CSS is deliberately translucent (alpha 0.78 black —
+        # the R6 bar language), so the honest gate is the PAIR: the same
+        # screen rect must read decisively DARKER with the chrome faded
+        # in than with it faded out (measured: 58 vs 125 for this clip).
+        state["strip_revealed_mean"] = m1
+        check("titlebar_strip_present", 0 <= m1, str(round(m1, 2)))
+        return again(s1, 650)          # 650 > 400 idle, playing
+
+    def s1():
+        w = win()
+        check("playing_idle_retracts_chrome", retracted(w),
+              f"fades={fades(w)}")
+        check("retracted_chrome_click_through", targets(w) == (False, False),
+              str(targets(w)))
+        return again(s1b, 350)
+
+    def s1b():
+        w = win()
+        # THE R12 invariant: retracting moved NOTHING.
+        alloc = video_alloc(w)
+        check("video_alloc_identical_across_retract",
+              alloc == state["alloc_revealed"],
+              f"revealed={state['alloc_revealed']} retracted={alloc}")
+        surf = (w.get_surface().get_width(), w.get_surface().get_height())
+        check("surface_identical_across_retract",
+              surf == state["surface_revealed"],
+              f"revealed={state['surface_revealed']} retracted={surf}")
+        shot("02-titlebar-gone", crop=TOP_STRIP)
+        m2 = image_mean(SHOTS / "02-titlebar-gone.xwd", TOP_STRIP)
+        m = image_mean(SHOTS / "02-titlebar-gone.xwd", VIDEO_MID)
+        check("same_strip_now_video", m2 > 25, str(round(m2, 2)))
+        m1 = state.get("strip_revealed_mean", 999)
+        check("revealed_strip_decisively_darker", m1 <= 0.6 * m2,
+              f"revealed={round(m1, 1)} retracted={round(m2, 1)}")
+        check("video_still_playing", m > 8, str(m))
+        w.chrome.motion(400, 300, 960, 540)      # wake seam, as the pointer
+        return again(s2, 250)
+
+    def s2():
+        w = win()
+        check("motion_reveals_chrome", revealed(w), str(fades(w)))
+        check("revealed_alloc_unchanged", video_alloc(w) ==
+              state["alloc_revealed"], str(video_alloc(w)))
+        w._actions["play-pause"](None)           # pause
+        state["pause_tries"] = 0
+        return again(s3, 250)
+
+    def s3():
+        w = win()
+        paused = w.core.snapshot.get("pause") is True
+        if (not paused or not revealed(w)) and state.get("pause_tries", 0) < 12:
+            state["pause_tries"] += 1
+            return again(s3, 250)
+        check("paused_keeps_chrome_revealed", paused and revealed(w),
+              f"pause={paused} fades={fades(w)}")
+        # back to playing; wait for the idle retraction, THEN open a menu
+        w._actions["play-pause"](None)
+        state["idle_tries"] = 0
+        return again(s4, 650)
+
+    def s4():
+        w = win()
+        if not retracted(w) and state.get("idle_tries", 0) < 12:
+            state["idle_tries"] += 1
+            return again(s4, 250)              # pause-flip lag tolerated
+        check("replaying_retracts_again", retracted(w), str(fades(w)))
+        w.chrome.motion(400, 300, 960, 540)     # user wakes, then opens menu
+        return again(s5, 150)
+
+    def s5():
+        w = win()
+        w._pl_pop.popup()                       # real popover open
+        return again(s6, 900)                   # 900 >> 400: hold required
+
+    def s6():
+        w = win()
+        held = revealed(w) and w._pl_pop.get_visible()
+        check("popover_open_blocks_retraction", held,
+              f"fades={fades(w)} pop={w._pl_pop.get_visible()}")
+        w._pl_pop.popdown()
+        return again(s7, 200)
+
+    def s7():
+        w = win()
+        check("popover_close_reveals", revealed(w), str(fades(w)))
+        state["rearm"] = 0
+        return again(s8, 650)                   # re-armed countdown expires
+
+    def s8():
+        w = win()
+        if not retracted(w) and state.get("rearm", 0) < 12:
+            state["rearm"] += 1
+            return again(s8, 250)
+        check("retract_after_rearm", retracted(w), str(fades(w)))
+        state["alloc_pre_fs"] = video_alloc(w)
+        w._actions["fullscreen"](None)
+        return again(s9, 150)
+
+    def s9():
+        w = win()
+        if not revealed(w) and state.get("rev_tries", 0) < 8:
+            state["rev_tries"] = state.get("rev_tries", 0) + 1
+            return again(s9, 150)        # the 180 ms crossfade must land
+        check("fullscreen_restores_revealed",
+              w._act_fullscreen_state() and revealed(w),
+              f"fs={w._act_fullscreen_state()} fades={fades(w)}")
+        state["fs_tries"] = 0
+        return again(s10, 650)
+
+    def s10():
+        w = win()
+        if not retracted(w) and state.get("fs_tries", 0) < 8:
+            state["fs_tries"] += 1
+            return again(s10, 250)
+        check("fullscreen_retracts_identically",
+              w._act_fullscreen_state() and retracted(w),
+              f"fs={w._act_fullscreen_state()} fades={fades(w)}")
+        w._actions["fullscreen"](None)          # leave fullscreen
+        return again(s11, 200)
+
+    def s11():
+        w = win()
+        check("leaving_fullscreen_restores",
+              (not w._act_fullscreen_state()) and revealed(w),
+              f"fs={w._act_fullscreen_state()} fades={fades(w)}")
+        check("window_size_restored_after_fullscreen",
+              video_alloc(w) == state["alloc_pre_fs"],
+              f"pre_fs={state['alloc_pre_fs']} now={video_alloc(w)}")
+        check("shots_captured",
+              (SHOTS / "01-titlebar-present.png").exists()
+              and (SHOTS / "02-titlebar-gone.png").exists(), str(SHOTS))
+        app.quit()
+        return False
+
+    GLib.timeout_add(50, guard(s0))
+    return False
 
 
 def main() -> int:

@@ -80,10 +80,20 @@ def seek_phase(app):
 
 
 def do_seek(app):
+    """Absolute seek to 40% of the clip.
+
+    The relative +5 s step looked fine on an idle box and flaked under load:
+    the clip is 10.000 s, so any position past ~4.3 s put the seek within a
+    second of EOF, and the follow-up "is time still advancing?" sample landed
+    after the file wrapped (9.53 -> 0.27) and failed a healthy player. A
+    mid-file target keeps the same assertion with real headroom on either side.
+    """
     from gi.repository import GLib
     win = state["win"]
     state["t_before"] = float(snap(win, "time-pos") or -1)
-    win._actions["seek-small"](+1)            # +5 s (ui.seek_step_s)
+    state["dur"] = float(snap(win, "duration") or 0.0)
+    state["target"] = max(1.0, state["dur"] * 0.4)
+    win.core.command("seek", f"{state['target']:.3f}", "absolute")
     GLib.timeout_add(1200, lambda: after_seek(app))
     return False
 
@@ -93,7 +103,8 @@ def after_seek(app):
     win = state["win"]
     before = state["t_before"]
     now = float(snap(win, "time-pos") or -1)
-    check("seek_jumps", now >= before + 4, f"{before:.2f}->{now:.2f}")
+    check("seek_jumps", abs(now - state["target"]) <= 1.5,
+          f"{before:.2f}->{now:.2f} want {state['target']:.2f}")
     state["t_after"] = now
     # time keeps advancing after the seek
     GLib.timeout_add(700, lambda: finish_phase(app))
@@ -103,6 +114,10 @@ def after_seek(app):
 def finish_phase(app):
     win = state["win"]
     t_b = float(snap(win, "time-pos") or -1)
+    # A wrap shows up here as a DECREASE (9.53->0.27); that value pair is the
+    # diagnosis, so there is no separate wrap check — an earlier one that
+    # tested "inside the file" passed on wrapped positions and was removed
+    # rather than kept as a check that did not do what its name claimed.
     check("timepos_advancing", t_b > state["t_after"] + 0.3,
           f"{state['t_after']:.2f}->{t_b:.2f}")
     win._actions["fullscreen"](None)

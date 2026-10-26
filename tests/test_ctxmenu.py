@@ -1,11 +1,12 @@
 """R6-A: context-menu model tests — pure Gio.Menu, no display, no mpv.
 
 Gate coverage (brief §A/§C): disabled filename header first; exact entry
-order Audio, Subtitles, Repeat, Playlist, Chapters, Tracks; missing data
-keeps the entry PRESENT but bound to the disabled no-op action; Repeat is
-a stateful radio with the three targets; playlist/chapter/track entries
-carry the exact integer targets the window routes to mpv; one shared
-track-label formatter.
+order Audio, Subtitles, Repeat, Crop to window (R11), Playlist, Chapters,
+Tracks; missing data keeps the entry PRESENT but bound to the disabled
+no-op action; Repeat is a stateful radio with the three targets; Crop to
+window is a live stateful-bool entry (its checkmark is action state, not
+model text); playlist/chapter/track entries carry the exact integer
+targets the window routes to mpv; one shared track-label formatter.
 """
 import _bootstrap  # noqa: F401  (sys.path for src/)
 import unittest
@@ -45,17 +46,29 @@ class TestStructure(unittest.TestCase):
     def test_body_order_exact(self):
         rows = flat(FULL)
         self.assertEqual([r[0] for r in rows[1:]],
-                         ["Audio", "Subtitles", "Repeat", "Playlist",
-                          "Chapters", "Tracks"])
+                         ["Audio", "Subtitles", "Repeat", "Crop to window",
+                          "Playlist", "Chapters", "Tracks"])
+
+    def test_crop_entry_directly_after_repeat(self):
+        rows = [r[0] for r in flat(FULL)[1:]]
+        self.assertEqual(rows[rows.index("Repeat") + 1], "Crop to window")
+
+    def test_crop_entry_is_stateful_action_no_target(self):
+        by = {r[0]: r for r in flat(FULL)}
+        row = by["Crop to window"]
+        self.assertEqual(row[1], "ctx.crop-to-window")
+        self.assertIsNone(row[2])          # bool ACTION state: no target
+        self.assertIsNone(row[3])          # a leaf entry, not a submenu
 
     def test_empty_snapshot_all_present_disabled(self):
         rows = flat({})
         self.assertEqual([r[0] for r in rows],
                          ["REELSEE", "Audio", "Subtitles", "Repeat",
-                          "Playlist", "Chapters", "Tracks"])
+                          "Crop to window", "Playlist", "Chapters",
+                          "Tracks"])
         for r in rows[1:]:
-            if r[0] == "Repeat":
-                continue          # repeat needs NO file data: live
+            if r[0] in ("Repeat", "Crop to window"):
+                continue          # live with NO file data
             self.assertEqual(r[1], "ctx.noop", r[0])
             self.assertIsNone(r[3], r[0])
 
@@ -136,8 +149,8 @@ class TestFullWiring(unittest.TestCase):
     ctx action group, and the six features of the former bar must all be
     present in body order next to the disabled header."""
 
-    BODY = ["Audio", "Subtitles", "Repeat", "Playlist", "Chapters",
-            "Tracks"]
+    BODY = ["Audio", "Subtitles", "Repeat", "Crop to window", "Playlist",
+            "Chapters", "Tracks"]
 
     def _walk(self, rows, out):
         for label, act, _t, sub in rows:
@@ -156,7 +169,7 @@ class TestFullWiring(unittest.TestCase):
                 self.assertTrue(str(act).startswith("ctx."),
                                 f"{label!r} -> {act!r}")
 
-    def test_seven_entries_header_plus_six_features(self):
+    def test_header_plus_seven_features(self):
         rows = flat(FULL)
         self.assertEqual([r[0] for r in rows],
                          ["file.mkv"] + self.BODY)

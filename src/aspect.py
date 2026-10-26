@@ -102,6 +102,27 @@ def aspect_of(snap) -> float | None:
     return None
 
 
+def aspect_lock_active(lock_setting, crop_on, fullscreen, maximized) -> bool:
+    """THE aspect-lock eligibility decision (R11-C), as one pure function.
+
+    Round 8 made the window TRACK the video's aspect; round 11 adds the
+    one state that must override it: CROP TO WINDOW.  A crop is literally
+    "the box may be any shape, the video fills it" — locking the box to
+    the video's aspect while cropping would undo the crop's whole point —
+    so crop-on SUSPENDS the lock, and crop-off re-arms it.  Turning the
+    setting itself while crop is on must not fight the suspension: this
+    single function is the only place eligibility is decided, so both the
+    resize path and the lock toggle read the same truth.
+
+    Fullscreen and maximized geometries are not ours to correct (round 8
+    `frozen` truth, folded in so the whole rule lives HERE):
+
+        lock_setting AND NOT crop_on AND NOT fullscreen AND NOT maximized
+    """
+    return bool(lock_setting) and not crop_on and not fullscreen \
+        and not maximized
+
+
 def fit_aspect(w, h, aspect, max_w=None, max_h=None,
                min_w: int = MIN_W, min_h: int = MIN_H) -> tuple[int, int]:
     """Box ``(w, h)`` → the aspect-faithful box for that box.  ALWAYS a

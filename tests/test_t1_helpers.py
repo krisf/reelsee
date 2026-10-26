@@ -159,7 +159,15 @@ class PropertyMap(unittest.TestCase):
 
     def test_kinds_valid(self):
         for key, (_prop, kind) in C.PROPERTY_MAP.items():
-            self.assertIn(kind, ("bool", "float", "str", "strno"), key)
+            self.assertIn(kind, ("bool", "boolnum", "float", "str",
+                                 "strno"), key)
+
+    def test_crop_to_window_rides_panscan(self):
+        # R11: the cover/fill toggle drives mpv's own cover zoom.
+        self.assertEqual(C.PROPERTY_MAP["video.crop_to_window"],
+                         ("panscan", "boolnum"))
+        self.assertEqual(C.coerce("boolnum", True), 1.0)
+        self.assertEqual(C.coerce("boolnum", False), 0.0)
 
     def test_sub_margin_is_y_not_v(self):
         self.assertEqual(C.PROPERTY_MAP["subtitles.margin_y"][0],

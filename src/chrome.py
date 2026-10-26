@@ -7,7 +7,15 @@ tests/test_chrome_state.py):
   * any pointer motion / click / wheel shows and RE-ARMS;
   * hovering the bottom 80 px keeps it visible;
   * a keyboard never re-arms the timer (keyboard seek while hidden shows a
-    1200 ms transient OSD — time + speed — without revealing the bars).
+    1200 ms transient OSD — time + speed — without revealing the bars);
+  * a TICK-GAP discontinuity (the gap between two successive tick() calls
+    goes negative or beyond TICK_GAP_MAX_MS — suspend, process stall,
+    backwards clock) RE-ARMS the idle countdown but NEVER changes
+    visibility: re-arm exists only so a stall cannot instantly hide a
+    chrome that was legitimately shown; it must never resurrect a chrome
+    the user already dismissed.  Elapsed idle time is not a jump (R13):
+    once hidden, the chrome stays hidden while ticks keep coming —
+    only input shows it again.
 GTK side applies visibility as opacity (180 ms CSS transition) + blank cursor.
 """
 from __future__ import annotations
@@ -16,7 +24,11 @@ import time
 
 IDLE_MS_DEFAULT = 3000.0
 BOTTOM_HOVER_PX = 80
-JUMP_FACTOR = 4.0          # dt > timeout*4 (or < 0) is a clock jump: re-arm
+TICK_GAP_MAX_MS = 2000.0   # gap between SUCCESSIVE TICKS beyond this (or
+                           # negative) is a clock discontinuity: re-arm
+                           # countdown, leave visibility untouched (R13)
+REVEAL_FADE_MS = 180.0     # R12: crossfade of the reveal groups — pure
+FADE_TICK_MS = 16          # opacity, allocation untouched
 
 
 # --------------------------------------------------------------------- repeat
@@ -156,6 +168,9 @@ class ChromeState:
         self.playing = True
         self.bottom_hover = False
         self._last_motion_ms = self.clock()
+        # R13: discontinuity is measured TICK-TO-TICK, never against the
+        # last input — None until the first tick establishes a baseline.
+        self._last_tick_ms: float | None = None
         self.visible = True
         self.reason = "start"
 
@@ -200,18 +215,32 @@ class ChromeState:
         self.reason = reason
 
     def tick(self, now_ms=None):
-        """Returns (visible, reason)."""
+        """Returns (visible, reason).
+
+        R13: a clock discontinuity is measured from the gap between
+        SUCCESSIVE TICKS, never from the last input.  Plain idleness makes
+        that input-gap grow without bound, and reading it as a "forward
+        clock jump" force-revealed the chrome every `timeout*factor` ms —
+        an endless hide/resurrect cycle with no pointer in the window.
+        A real discontinuity (suspend, stall, backwards clock) therefore
+        only RE-ARMS the idle countdown from the jump instant; visibility
+        is untouched, because re-arm exists solely to stop a stall from
+        hiding the chrome the instant it resumes.  Once hidden it stays
+        hidden while ticks keep coming: only input shows it again.
+        """
         t = self._t(now_ms)
+        prev = self._last_tick_ms
+        self._last_tick_ms = t
+        if prev is not None:
+            gap = t - prev
+            if gap < 0.0 or gap > TICK_GAP_MAX_MS:
+                self._last_motion_ms = t   # discontinuity: re-arm, keep
         if not self.playing:
             self._show("not-playing")
         elif self.bottom_hover:
             self._show("hover")
         else:
-            dt = t - self._last_motion_ms
-            if dt < 0.0 or dt > self.timeout_ms * JUMP_FACTOR:
-                self._last_motion_ms = t          # clock jump: re-arm, keep
-                self._show("clock-jump")
-            elif dt >= self.timeout_ms:
+            if t - self._last_motion_ms >= self.timeout_ms:
                 self.visible = False
                 self.reason = "idle"
             # else: state unchanged
@@ -235,13 +264,19 @@ def _rect(x, y, w, h):
 
 BLACK_CSS = b"""
 window.reelsee-black { background-color: #000000; }
-/* R5-A: the real titlebar rides the same OLED-black skin (Looksee 13.1.1:
- * the class goes on window + headerbar ONLY, never on popovers/buttons). */
-headerbar.reelsee-black {
-    background-color: #000000;
-    color: #e6e6e6;
+/* R12: the chrome OVERLAYS the video - the only real titlebar widget is
+ * a ZERO-HEIGHT stub, kept so client-side decoration (shadow, resize
+ * edges) stays active while contributing NOTHING to the layout.  The
+ * theme puts min-height/padding on the titlebar node, so pin it flat
+ * here (application priority). */
+.reelsee-titlebar-stub {
+    min-height: 0px;
+    min-width: 0px;
+    padding: 0px;
+    margin: 0px;
+    border: none;
     box-shadow: none;
-    border-bottom: none;
+    background: none;
 }
 
 /* R5-C: repeat toggle, off state = same glyph dimmed */
@@ -391,6 +426,15 @@ class Chrome:
         self._cursor_blank = False
         self._last_playing = None
         self._bars_visible = True
+        # R12: the reveal groups — every widget that fades WITH the bar
+        # decision.  Reveal/hide is OPACITY only (plus can_target=False
+        # once fully hidden): the widgets keep their allocation for the
+        # whole animation, so nothing underneath — the video — is ever
+        # re-laid out.  The bottom bar is always in the group; the window
+        # registers its top overlay strip via add_reveal_widget().
+        self._reveal_widgets: list = []
+        self._fade_ids: dict = {}       # id(widget) -> pending GLib source
+        self._fade_target: dict = {}    # id(widget) -> target in flight
         self._preview_frac = None
         self._menu_open = 0      # R5-A: open popovers block retraction
 
@@ -398,6 +442,7 @@ class Chrome:
         self.bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
                               spacing=8)
         self.bottom.add_css_class("reelsee-chrome")
+        self._reveal_widgets.append(self.bottom)   # R12: fades as one group
         # R6-B FIRST: play/pause — an ICON button whose icon/tooltip/a11y
         # label are painted from the OBSERVED snapshot in update_snapshot,
         # activating the SAME win.play-pause action that Space uses.
@@ -591,32 +636,32 @@ class Chrome:
         return self._bars_visible
 
     # ------------------------------------------------------------ visibility
+    def add_reveal_widget(self, widget) -> None:
+        """R12: register an overlay chrome widget (the window's top strip)
+        to fade with the bar decision — opacity + can_target ONLY, the
+        widget never loses its allocation."""
+        widget.set_opacity(1.0 if self._bars_visible else 0.0)
+        widget.set_can_target(bool(self._bars_visible))
+        self._reveal_widgets.append(widget)
+
+    def set_reveal(self, visible: bool) -> bool:
+        """Apply the reveal decision from OUTSIDE the tick (state edges:
+        fullscreen enter/exit).  Returns the applied visibility."""
+        self._set_chrome_visible(bool(visible))
+        return self._bars_visible
+
     def tick(self) -> bool:
         """Apply ChromeState to the widgets. Returns current visibility.
 
-        R5-A: the returned visibility is also THE decision mirrored onto the
-        window's Adw.ToolbarView (set_reveal_top_bars) — one decision, one
-        animation source.  An open popover holds it revealed (menu must
-        never be stranded by a retracting anchor bar)."""
+        R12: the visibility decision is applied to EVERY reveal group
+        (bottom bar + top overlay strip) by OPACITY crossfade only — no
+        set_child_visible, no allocation change, so the video never
+        resizes when chrome appears or retracts.  An open popover holds
+        it revealed (menu must never be stranded by a retracting bar)."""
         visible, _reason = self.state.tick()
         if self._menu_open:
             visible = True
-        changed = visible is not self._bars_visible
-        for bar in (self.bottom,):
-            bar.set_child_visible(visible)
-            bar.set_opacity(1.0 if visible else 0.0)
-            # GTK overlay damage bug (P5 finding): a queue_draw() landing
-            # while a bar is child-invisible (seek.value follows time-pos
-            # the whole time playback runs) leaves the bar UNPAINTED when
-            # it is re-shown — neither the child-visible flip nor any
-            # later queue_draw repairs it.  A same-frame visible False/
-            # True nudge on the overlay child forces the subtree to
-            # revalidate+repaint (verified minimal repro, GTK 4.22).
-            if changed and visible:
-                bar.set_visible(False)
-                bar.set_visible(True)
-        self._bars_visible = visible
-        self._blank_cursor(visible is False)
+        self._set_chrome_visible(visible)
         # OSD auto-hide (transient, independent of the bars)
         now = self.state.clock()
         if self._osd_deadline and now >= self._osd_deadline:
@@ -626,6 +671,68 @@ class Chrome:
             self._toast_deadline = 0.0
             self.toast.set_visible(False)
         return visible
+
+    def _set_chrome_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        changed = visible is not self._bars_visible
+        self._bars_visible = visible
+        for w in self._reveal_widgets:
+            self._fade_to(w, 1.0 if visible else 0.0)
+        if changed:
+            self._blank_cursor(not visible)
+
+    def _fade_to(self, widget, target: float) -> None:
+        """Crossfade one reveal widget (REVEAL_FADE_MS).  Pure opacity:
+        the widget stays MAPPED with its allocation the whole time, so
+        (a) the video's allocation is untouched and (b) the old P5 GTK
+        bug — a queue_draw landing while a bar is child-INVISIBLE leaves
+        it unpainted when re-shown — cannot arise at all any more: there
+        is no child-visible flip to lose a repaint behind.
+
+        can_target flips with visibility (a hidden chrome is click-
+        THROUGH — presses reach the video, exactly like the old unmapped
+        bar), but only once the fade-out actually lands, so a button is
+        never un-clickable while visibly fading."""
+        key = id(widget)
+        if key in self._fade_ids and self._fade_target.get(key) == target:
+            # A fade to THIS target is already running: tick() re-applies
+            # the same decision every poll — re-arming here would cancel
+            # the running timer each poll and starve the fade (frozen at
+            # its start opacity; observed in the R12 chrome smoke).
+            return
+        sid = self._fade_ids.pop(key, None)
+        if sid is not None:
+            GLib.source_remove(sid)
+        start = float(widget.get_opacity())
+        if target > start:
+            widget.set_can_target(True)    # interactive from frame one
+        if abs(target - start) < 0.001:
+            widget.set_opacity(target)
+            widget.set_can_target(bool(target))
+            self._fade_target[key] = target
+            return
+
+        t0 = self.state.clock()
+
+        def step() -> bool:
+            now = self.state.clock()
+            if now - t0 >= REVEAL_FADE_MS:
+                self._fade_ids.pop(key, None)
+                self._fade_target[key] = target
+                widget.set_opacity(target)
+                widget.set_can_target(bool(target))
+                return False
+            widget.set_opacity(
+                start + (target - start) * (now - t0) / REVEAL_FADE_MS)
+            return True
+
+        # Record the IN-FLIGHT target at schedule time: the guard above
+        # must compare against what the running timer actually fades to
+        # (leaving the stale previous target here made tick() re-schedule
+        # every poll — starving the fade — or swallow the opposite
+        # decision — inverting it; found by the R12 chrome smoke).
+        self._fade_target[key] = target
+        self._fade_ids[key] = GLib.timeout_add(FADE_TICK_MS, step)
 
     def _blank_cursor(self, blank: bool) -> None:
         if blank == self._cursor_blank:

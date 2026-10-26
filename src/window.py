@@ -51,6 +51,21 @@ def make_aspect_lock_action(on: bool) -> Gio.SimpleAction:
     return Gio.SimpleAction.new_stateful(
         "toggle-aspect-lock", None, GLib.Variant("b", bool(on)))
 
+
+def make_crop_action(on: bool) -> Gio.SimpleAction:
+    """`win.crop-to-window` — the command-palette surface of the R11
+    checkable "Crop to window" menu entry (cover/fill: the video fills the
+    window, the overflow is clipped).
+
+    Built in ONE place for the same measured reason as
+    make_aspect_lock_action: a stateful action with BOOLEAN state must be
+    created with parameter_type=None, or `activate_action(name, None)` —
+    exactly what the command palette does — trips g_simple_action_activate
+    and the action silently never fires.  The state doubles as the context
+    menu's checkmark (Gtk renders bool-state actions checked)."""
+    return Gio.SimpleAction.new_stateful(
+        "crop-to-window", None, GLib.Variant("b", bool(on)))
+
 WINDOW_EXTRA_OBSERVED = {
     "playlist-count": M.MPV_FORMAT_INT64,
     "chapter": M.MPV_FORMAT_INT64,
@@ -80,6 +95,10 @@ WINDOW_EXTRA_OBSERVED = {
     "dheight": M.MPV_FORMAT_INT64,
     "width": M.MPV_FORMAT_INT64,
     "height": M.MPV_FORMAT_INT64,
+    # R11: the crop-to-window live truth (0.0/1.0).  Observed, never
+    # polled: the smokes (and any future display) read it through the
+    # snapshot like every other mutable input (R9 discipline).
+    "panscan": M.MPV_FORMAT_DOUBLE,
 }
 
 
@@ -97,7 +116,14 @@ def _abs_entry(u):
     return os.path.abspath(u)
 
 
-class ReelseeWindow(Adw.ApplicationWindow):
+class ReelseeWindow(Gtk.ApplicationWindow):
+    # R12: Gtk.ApplicationWindow, NOT Adw.ApplicationWindow — Adwaita
+    # ABORTS at gtk_window_set_titlebar() for its own window class, and
+    # R12 requires a real (zero-height) titlebar widget so client-side
+    # decoration — shadow, resize edges — stays active while the chrome
+    # overlays the video.  Nothing else here depended on Adwaita's window
+    # class; the settings dialog keeps using Adw.PreferencesWindow (the
+    # idempotent Adw.init() below stays for it).
     def __init__(self, app, config, lib, engine_override=None):
         Adw.init()                              # R5-A: idempotent, safe
         super().__init__(application=app)
@@ -110,6 +136,10 @@ class ReelseeWindow(Adw.ApplicationWindow):
         self._closing = False
         self._fs = False
         self._transient_muted = False
+        # R11: mirror of the persisted crop-to-window truth (the ONE writer
+        # _set_crop keeps it, the surfaces and §C's aspect-lock decision
+        # read it).  Seeded from config in _build_actions.
+        self._crop_on = False
         # §4.8 playlist/folder IO state
         self.playlist: list[str] | None = None
         self.playlist_dir: str | None = None
@@ -156,24 +186,32 @@ class ReelseeWindow(Adw.ApplicationWindow):
         self._click_pt: tuple[float, float] | None = None
         self._click_singleshot = 0
 
-        # R5-A: the ENTIRE chrome retracts — real titlebar (min/max/close)
-        # included.  Adw.ApplicationWindow + Adw.ToolbarView with an
-        # Adw.HeaderBar top bar (window controls + centred, ellipsized
-        # filename as title_widget); ToolbarView.set_reveal_top_bars() is
-        # THE one and only retraction animation (Looksee mechanism) — no
-        # hand-rolled opacity on the title bar.  The GLArea + chrome
-        # overlays live in the ToolbarView content slot.
+        # R12: the chrome OVERLAYS the video and NEVER reserves layout
+        # space for it.  The window content is the Gtk.Overlay itself:
+        # BASE child = the render view (inside Gtk.WindowHandle, so drag-
+        # anywhere keeps working), and EVERY piece of chrome is an overlay
+        # child painted on top of the video — the top strip (media title
+        # + our own minimise / maximise-restore / close buttons, aligned
+        # START) and the bottom bar + OSD/preview/toast.  The video owns
+        # the whole client area at all times, so reveal/hide is opacity
+        # ONLY and the video never resizes with the chrome.  (The old
+        # Adw.ToolbarView gave the top bar real layout space and
+        # set_reveal_top_bars() re-flowed the content — the shrink/grow
+        # bug this round kills; ToolbarView is GONE for every config.)
+        # The window stays client-side decorated: set_titlebar() keeps a
+        # widget — a ZERO-HEIGHT stub — so the CSD machinery (shadow,
+        # resize edges via _GTK_FRAME_EXTENTS/mutter hints) stays intact
+        # while the stub contributes nothing to the layout.
         self._title_label = Gtk.Label(label="REELSEE", xalign=0.5)
         self._title_label.set_ellipsize(Pango.EllipsizeMode.END)
         self._title_label.set_max_width_chars(48)   # never width-chars
-        self.header = Adw.HeaderBar(title_widget=self._title_label)
-        self.header.add_css_class("reelsee-black")
-        # start/end title buttons (min/max/close) show by default; the
-        # decoration layout is pinned app-wide in reelsee.run() (R5-A).
-        self._toolbar = Adw.ToolbarView()
-        self._toolbar.add_top_bar(self.header)
-        self._toolbar.set_content(self.overlay)
-        self.set_content(self._toolbar)
+        self.top_bar = self._build_top_chrome()
+        self._titlebar_stub = Gtk.Box()
+        self._titlebar_stub.add_css_class("reelsee-titlebar-stub")
+        self.set_titlebar(self._titlebar_stub)
+        # Gtk.Window content slot: the overlay IS the window content —
+        # every piece of chrome floats over the video, none reserves px.
+        self.set_child(self.overlay)
 
         self.chrome = chrome.Chrome(
             self, config,
@@ -183,10 +221,17 @@ class ReelseeWindow(Adw.ApplicationWindow):
                                               else "set_b"),
             on_repeat=self._repeat_cycle,
             on_decode=self._toggle_decode)   # R7-B: the decode toggle
+        # R12: the top strip is an overlay child too — added FIRST so the
+        # z-order matches the old contract (OSD/toast paint over it, the
+        # bottom bar stays topmost).
+        self.overlay.add_overlay(self.top_bar)
         for c in self.chrome.overlay_children():
             # R8-A: every child is added UNCONDITIONALLY — the deleted top
             # menu bar is not returned at all (it exists for NO config).
             self.overlay.add_overlay(c)
+        # R12: the top strip fades as ONE group with the bottom bar
+        # (opacity + can_target only — see Chrome.set_reveal).
+        self.chrome.add_reveal_widget(self.top_bar)
         mc = Gtk.EventControllerMotion()
         mc.connect("motion", lambda _c, x, y: self.chrome.motion(
             x, y, self.overlay.get_width(), self.overlay.get_height()))
@@ -386,7 +431,8 @@ class ReelseeWindow(Adw.ApplicationWindow):
         """Fresh snapshot-derived model, popped up AT the pointer.
         R8-A: this is THE menu — every feature the deleted top menu bar
         had lives here (header + Audio, Subtitles, Repeat, Playlist,
-        Chapters, Tracks), wired to the same handlers."""
+        Chapters, Tracks; R11 adds Crop to window after Repeat), wired to
+        the same handlers."""
         pop = getattr(self, "_ctx_pop", None)
         if pop is None or self._closing:
             return
@@ -446,6 +492,20 @@ class ReelseeWindow(Adw.ApplicationWindow):
             lambda a, v: self._set_repeat_mode(v.unpack(), action=a))
         ag.add_action(self._ctx_repeat)
         self._rep_mode = _rep_seed
+        # R11: "Crop to window" — a STATEFUL boolean action, so Gtk renders
+        # the checkmark straight from its state (no model-side check text).
+        # Seeded from the persisted key; the ONE writer (_set_crop) mirrors
+        # every change here and on the palette action.
+        self._ctx_crop = Gio.SimpleAction.new_stateful(
+            "crop-to-window", None,
+            GLib.Variant("b", bool(self.cfg.get("video.crop_to_window",
+                                                False))))
+        self._ctx_crop.connect(
+            "change-state",
+            lambda a, v: self._set_crop(
+                a.get_state().get_boolean() if v is None
+                else v.get_boolean()))
+        ag.add_action(self._ctx_crop)
         self._ctx_pop = Gtk.PopoverMenu(menu_model=ctxmenu.build(
             self.core.snapshot))
         self._ctx_pop.set_parent(self.view.area)
@@ -486,6 +546,70 @@ class ReelseeWindow(Adw.ApplicationWindow):
         self.chrome.set_repeat(mode)     # immediate feedback (pre-snapshot)
         self.chrome.show_osd("Repeat: " + mode)
 
+    # ------------------------------------------------- R11 crop to window
+    def _set_crop(self, on: bool) -> None:
+        """THE one writer of crop-to-window (R11).  The context-menu entry
+        and the palette action (and the settings row's live mirror) all
+        land here; nothing else writes the state.
+
+        The R9 repeat lesson, applied: the writer PERSISTS
+        `video.crop_to_window` (PERSIST_NOW, so a toggle followed by a
+        quick quit survives) AND applies the live `panscan` property.  The
+        key is in PROPERTY_MAP, so every replace-load runs
+        `_push_all_settings()` and re-applies it — the choice survives
+        file changes — and engine.mpv_init_options seeds it at mpv start,
+        so it survives restart without a first-frame flicker.
+
+        Live mechanism: panscan=1.0 with keepaspect=yes (mpv's own cover
+        zoom: fill the window, clip the overflow) — MEASURED on this
+        build to render through the embedded vo=libmpv render API, unlike
+        a hand-computed zoom that would need re-deriving on every resize.
+        The state mirrors onto BOTH surfaces (palette check + menu
+        checkmark) before any feedback, and the OSD reports on/off."""
+        on = bool(on)
+        self._crop_on = on
+        self.cfg.set("video.crop_to_window", on)
+        self.core.set_property("panscan", 1.0 if on else 0.0)
+        for act in (getattr(self, "_crop_action", None),
+                    getattr(self, "_ctx_crop", None)):
+            if act is not None and act.get_state().get_boolean() != on:
+                act.set_state(GLib.Variant("b", on))
+        suffix = self._crop_aspect_effect(on)
+        self.chrome.show_osd("Crop to window: "
+                             + ("on" if on else "off") + suffix)
+
+    def _act_crop(self, action, value) -> None:
+        """win.crop-to-window — palette activation toggles (bool state +
+        parameterless activation is GAction's own toggle convenience; the
+        None arm keeps a hand-activated call working)."""
+        new = (value.get_boolean() if value is not None
+               else not action.get_state().get_boolean())
+        self._set_crop(new)
+
+    def _crop_aspect_effect(self, on: bool) -> str:
+        """§C (round 11): crop-ON suspends the aspect lock (a crop needs a
+        freely resizable box), crop-OFF re-arms it and snaps the window
+        back to the video's aspect — in both cases only when the lock
+        setting actually wanted to be on.  Returns the OSD suffix it wants
+        spelled out (the ONE hint per toggle — never per resize)."""
+        try:
+            wanted = bool(self.cfg.get("ui.lock_aspect", True))
+        except Exception:
+            wanted = False
+        if not wanted or self._closing:
+            return ""
+        if on:
+            self._aspect_forget()      # free NOW: crop wants a free box
+            return "  ·  aspect lock paused"
+        self._aspect_realign()
+        return ""
+
+    def _sync_crop_action(self, on: bool) -> None:
+        """Mirror an out-of-band change (the settings row pushes the live
+        property through apply_live without ever meeting _set_crop) into
+        the ONE writer, so actions, checkmark and OSD never disagree."""
+        self._set_crop(bool(on))
+
     def _set_handle_active(self, on: bool) -> None:
         """R5-D: the WindowHandle is IN the tree only while windowed.
         Fullscreen detaches it and re-parents the bare GLArea, so a drag
@@ -501,12 +625,64 @@ class ReelseeWindow(Adw.ApplicationWindow):
             h.set_child(None)
             self.overlay.set_child(self.view.area)
 
+    def _build_top_chrome(self) -> Gtk.Box:
+        """R12: the top overlay strip — media title plus OUR OWN window
+        controls (minimise / maximise-restore / close).  It is an overlay
+        child, not a titlebar: retracting it only fades opacity, and no
+        button starts a window drag (there is no WindowHandle above it)
+        nor toggles playback (a press is claimed by the button and can
+        never reach the video's click gesture underneath)."""
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        bar.set_valign(Gtk.Align.START)
+        bar.set_halign(Gtk.Align.FILL)
+        bar.add_css_class("reelsee-chrome")
+        bar.set_margin_top(4)
+        bar.set_margin_start(6)
+        bar.set_margin_end(6)
+        self._title_label.set_hexpand(True)
+        bar.append(self._title_label)
+        self.btn_min = Gtk.Button(icon_name="window-minimize-symbolic")
+        self.btn_max = Gtk.Button(icon_name="window-maximize-symbolic")
+        self.btn_close = Gtk.Button(icon_name="window-close-symbolic")
+        for b, tip in ((self.btn_min, "Minimise"),
+                       (self.btn_max, "Maximise"),
+                       (self.btn_close, "Close")):
+            b.add_css_class("reelsee-chrome")
+            b.set_tooltip_text(tip)
+            bar.append(b)
+        # The controls act on the window and NOTHING else — each handler
+        # is one window call (the gate spy-invokes all three).  Dynamic
+        # dispatch (self.minimize()…), so tests can substitute the window
+        # methods and watch the exact call.
+        self.btn_min.connect("clicked", lambda *_a: self.minimize())
+        self.btn_max.connect("clicked", self._on_maxrestore_clicked)
+        self.btn_close.connect("clicked", lambda *_a: self.close())
+        # Maximise/restore: the icon and tooltip track maximized-state.
+        self.connect("notify::maximized", self._on_maximized_notify)
+        return bar
+
+    def _on_maxrestore_clicked(self, *_a) -> None:
+        if self.is_maximized():
+            self.unmaximize()
+        else:
+            self.maximize()
+
+    def _on_maximized_notify(self, *_a) -> None:
+        maxed = self.is_maximized()
+        img = self.btn_max.get_child()
+        if isinstance(img, Gtk.Image):
+            img.set_from_icon_name(
+                "window-restore-symbolic" if maxed
+                else "window-maximize-symbolic")
+        self.btn_max.set_tooltip_text("Restore" if maxed else "Maximise")
+
     def _apply_reveal(self, visible: bool) -> None:
-        """R5-A: THE single retraction mechanism for the real titlebar —
-        Adw.ToolbarView's own reveal transition, driven by the same
-        ChromeState decision that fades the in-content bars.  No second
-        hand-rolled animation anywhere (Looksee pattern)."""
-        self._toolbar.set_reveal_top_bars(bool(visible))
+        """R12: the single reveal path — Chrome crossfades EVERY reveal
+        group (bottom bar AND the top strip with the window controls)
+        by OPACITY only and flips can_target when hidden; no allocation
+        ever changes, so the video's size is invariant across the whole
+        animation (ChromeState remains the one decision-maker)."""
+        self.chrome.set_reveal(bool(visible))
 
     # R8-A: the former _apply_top_menu_setting() (ui.show_top_menu) is GONE
     # entirely — the setting has no default, no settings row and no
@@ -920,7 +1096,7 @@ class ReelseeWindow(Adw.ApplicationWindow):
         if self._fs or self.is_fullscreen():
             base = f"[{base}]"
         self.set_title(base)
-        # R5-A: the headerbar's centred title_widget shows the FILENAME —
+        # R12: the top strip's centred title label shows the FILENAME —
         # ellipsized, max-width-chars bounded (set at creation), never the
         # decorated WM title.
         self._title_label.set_label(str(name) if name else "REELSEE")
@@ -1232,18 +1408,33 @@ class ReelseeWindow(Adw.ApplicationWindow):
     # fight the compositor, never fight ourselves.
     def _aspect_locked(self) -> bool:
         """Read LIVE, on every signal: flipping ui.lock_aspect off takes
-        effect on the very next layout event — no restart, no cached flag."""
+        effect on the very next layout event — no restart, no cached flag.
+
+        R11-C: this is the ONE eligibility question the round-8 machinery
+        asks, and it now delegates to the single pure truth,
+        aspect.aspect_lock_active — the setting, the crop suspension
+        (crop-to-window means "any shape is fine", so a lock fight would
+        undo the crop) and the not-ours-to-correct geometries are decided
+        in exactly one place, never twice."""
         try:
-            return bool(self.cfg.get("ui.lock_aspect", True))
+            setting = bool(self.cfg.get("ui.lock_aspect", True))
         except Exception:                          # noqa: BLE001
-            return False
+            setting = False
+        try:
+            fs = bool(self._fs) or self.is_fullscreen()
+            mx = bool(self.is_maximized())
+        except Exception:                          # noqa: BLE001
+            fs = mx = False
+        return aspect.aspect_lock_active(setting, self._crop_on, fs, mx)
 
     def _aspect_frozen(self) -> bool:
         """Geometries that are not ours to correct: fullscreen, maximized,
         and the moment right after a fullscreen toggle (leaving fullscreen
         must not snap the window to a size nobody asked for).  self._fs is
         the app's own flag because X11 without a window manager never sends
-        the state notify back (P2 finding); the real state is secondary."""
+        the state notify back (P2 finding); the real state is secondary.
+        R11-C: fs/maximized also live inside aspect.aspect_lock_active (the
+        single eligibility truth); this stays as the TIMING guard."""
         if self._fs or self.is_fullscreen() or self.is_maximized():
             return True
         return time.monotonic() < self._aspect_free_until
@@ -1341,7 +1532,7 @@ class ReelseeWindow(Adw.ApplicationWindow):
 
     def _apply_aspect_size(self, size: tuple[int, int]) -> None:
         """set_default_size() is the ONE proven way to resize a mapped
-        Adw.ApplicationWindow on this build (Gtk.Window.resize() does not
+        application window on this build (Gtk.Window.resize() does not
         exist).  The guard is armed BEFORE the call because the answer
         arrives through the very signal we are reacting to."""
         self._aspect_applying = True
@@ -1532,6 +1723,14 @@ class ReelseeWindow(Adw.ApplicationWindow):
         lock.connect("change-state", self._act_aspect_lock)
         group.add_action(lock)
         self._aspect_lock_action = lock
+        # R11: crop-to-window joins the palette as a STATEFUL boolean —
+        # same measured construction (make_crop_action) and the same ONE
+        # writer discipline; it toggles straight from a palette entry.
+        self._crop_on = bool(self.cfg.get("video.crop_to_window", False))
+        crop = make_crop_action(self._crop_on)
+        crop.connect("change-state", self._act_crop)
+        group.add_action(crop)
+        self._crop_action = crop
 
     # --------------------------------------------------- §7 T1 menu popovers
     @staticmethod
@@ -1569,9 +1768,10 @@ class ReelseeWindow(Adw.ApplicationWindow):
         # mapped widgets the snapshot keeps populated (and a popover open
         # still holds the chrome revealed — same rule as the context menu).
         pop.set_parent(self.view.area)
-        # R5-A: an open popover must hold the chrome (and the headerbar)
-        # revealed — retracting its anchor would strand the menu — and the
-        # idle timer re-arms when it closes.
+        # R5-A: an open popover must hold the chrome (R12: the top strip
+        # too — it fades as one group) revealed — retracting its anchor
+        # would strand the menu — and the idle timer re-arms when it
+        # closes.
         pop.connect("notify::visible", self._on_popover_visible)
         return pop
 
@@ -1982,6 +2182,10 @@ class ReelseeWindow(Adw.ApplicationWindow):
                 # "restore completely free resizing immediately": the guard
                 # and any queued correction go away with the setting.
                 self._aspect_forget()
+        elif key == "video.crop_to_window":      # R11 (video page)
+            # apply_live already pushed panscan via PROPERTY_MAP; route
+            # through the ONE writer so actions/checkmark/OSD agree.
+            self._sync_crop_action(value)
         elif key in ("ui.remember_geometry", "ui.cascade_offset_px"):
             # R10-C: intentionally NO live plumbing — both are read fresh
             # when the NEXT window opens (plan_open_geometry), which IS the

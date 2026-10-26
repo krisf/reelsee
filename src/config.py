@@ -60,6 +60,10 @@ DEFAULTS: dict = {
                   "color": "#ffffff", "border_size": 3.0, "margin_y": 50.0},
     "video": {"aspect": "no", "zoom": 0.0, "pan_x": 0.0, "pan_y": 0.0,
               "rotate": 0.0, "crop": "no", "brightness": 0.0, "contrast": 0.0,
+              # R11: "Crop to window" — fill the window, clip the overflow
+              # (cover semantics).  Persisted like mute/repeat (R9 lesson:
+              # the ONE writer persists AND applies the live property).
+              "crop_to_window": False,
               "saturation": 0.0, "gamma": 0.0, "hue": 0.0,
               "deinterlace": "auto", "scale_preset": "default",
               "deband": False, "dither_depth": "auto", "interpolation": False,
@@ -74,14 +78,15 @@ DEFAULTS: dict = {
 # a toggle followed by a quick quit would still be lost.
 PERSIST_NOW_KEYS = {("audio", "muted"), ("audio", "volume"),
                     ("playback", "loop_file"),
-                    ("playback", "loop_playlist")}
+                    ("playback", "loop_playlist"),
+                    ("video", "crop_to_window")}
 
 DEBOUNCE_S = 0.25
 
 # ------------------------------------------------------- live property map --
 # §7 T1: every config leaf that maps 1:1 onto a *runtime-settable* mpv
-# property.  Value kinds: "bool" | "float" | "str" | "strno" (empty/None →
-# "no").  Keys NOT here (engine.*, ui.chrome_timeout_ms, ab.count,
+# property.  Value kinds: "bool" | "boolnum" (bool → 1.0/0.0) | "float" |
+# "str" | "strno" (empty/None → "no").  Keys NOT here (engine.*, ui.chrome_timeout_ms, ab.count,
 # video.scale_preset, playback.video_off) are handled by window hooks —
 # settings_ui.apply_live pushes everything else to every open core.
 PROPERTY_MAP: dict[str, tuple[str, str]] = {
@@ -110,6 +115,12 @@ PROPERTY_MAP: dict[str, tuple[str, str]] = {
     "video.pan_y": ("video-pan-y", "float"),
     "video.rotate": ("video-rotate", "float"),
     "video.crop": ("video-crop", "strno"),
+    # R11: crop-to-window (cover/fill) rides mpv's pan-scan: panscan=1.0
+    # with keepaspect=yes (the default) zooms to FULL fill and clips the
+    # overflow — exactly the brief's cover semantics, and MEASURED (round
+    # 11 probe) to have a visible effect through the embedded vo=libmpv
+    # render API.  boolnum because panscan is numeric, not a flag.
+    "video.crop_to_window": ("panscan", "boolnum"),
     "video.brightness": ("brightness", "float"),
     "video.contrast": ("contrast", "float"),
     "video.saturation": ("saturation", "float"),
@@ -133,6 +144,8 @@ def coerce(kind: str, value):
     try:
         if kind == "bool":
             return bool(value)
+        if kind == "boolnum":
+            return 1.0 if value else 0.0
         if kind == "float":
             return float(value)
         if kind == "strno":

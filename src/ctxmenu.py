@@ -14,7 +14,8 @@ every config.
 
 Rules implemented here (round 6 brief §A):
   * a disabled filename header is the first section;
-  * body order: Audio, Subtitles, Repeat, Playlist, Chapters, Tracks;
+  * body order: Audio, Subtitles, Repeat, Crop to window, Playlist,
+    Chapters, Tracks (R11 inserted the checkable crop toggle);
   * an entry whose data is missing in the snapshot stays PRESENT but
     insensitive — modelled as an item bound to the always-disabled
     ``ctx.noop`` action (GTK renders action-bound items insensitive when
@@ -119,6 +120,13 @@ def build(snap) -> Gio.Menu:
         _add(sub, mode.capitalize(), f"{APP}.repeat",
              GLib.Variant("s", mode))
     _submenu_item(body, "Repeat", sub)
+
+    # ---- Crop to window (R11: stateful checkable toggle directly after
+    # Repeat).  The CHECKMARK is rendered by Gtk from the ctx.crop-to-window
+    # BOOLEAN ACTION STATE — the model only points at the action, because a
+    # fresh model per popup must never bake a stale checkmark into a label.
+    # Always live: it needs no file data, exactly like Repeat.
+    _add(body, "Crop to window", f"{APP}.crop-to-window")
 
     # ---- Playlist -------------------------------------------------------
     pl = snap.get("playlist")

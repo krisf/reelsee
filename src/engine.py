@@ -60,6 +60,11 @@ def fixed_init_options() -> dict[str, str]:
         "msg-level": "all=warn",
         "osc": "no",
         "osd-level": "0",
+        # R11: the crop-to-window mechanism (panscan=1.0) is a COVER ZOOM
+        # only while the aspect is kept — panscan with keepaspect=no would
+        # STRETCH instead of fill-and-clip.  mpv defaults to yes; pinned
+        # so the mechanism can never silently degrade to distortion.
+        "keepaspect": "yes",
     }
 
 
@@ -106,6 +111,12 @@ def mpv_init_options(cfg, headless: bool, n_windows: int = 1,
         _val = valid_loop_value(cfg.get(_key))
         if _val is not None:
             opts[_opt] = _val
+    # R11: crop-to-window obeys the same restart contract — a persisted
+    # "on" is the core's BEGINNING state (the very first frame already
+    # fills the window; no flicker), and the PROPERTY_MAP push on load
+    # simply agrees with it.  "off" needs no seed (panscan defaults to 0).
+    if bool(cfg.get("video.crop_to_window", False)):
+        opts["panscan"] = "1"
     if headless:                            # R13: never touch real hw in CI
         opts["hwdec"] = "no"
         opts["ao"] = "null"

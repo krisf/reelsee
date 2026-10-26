@@ -1,7 +1,7 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: reelsee
 Upstream-Contact: Kris Forbes <krisf@users.noreply.github.com>
-Source: https://github.com/krisforbes/reelsee
+Source: https://github.com/krisf/reelsee
 
 Files: *
 Copyright: 2026 Kris Forbes <krisf@users.noreply.github.com>

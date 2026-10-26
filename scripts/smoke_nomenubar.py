@@ -22,9 +22,9 @@ NOTHING any more.  Gates (brief §C token names verbatim):
       window title, where the bar's own
       label used to be;
   * settings_model_has_no_dead_setting— the settings window has no row;
-  * menu_has_all_7_entries_in_order   — media-title header + Audio, Subtitles,
-      Repeat, Playlist, Chapters, Tracks,
-      in that order;
+  * menu_has_all_8_entries_in_order   — media-title header + Audio,
+      Subtitles, Repeat, Crop to window
+      (R11), Playlist, Chapters, Tracks, in that order;
   * chapters_present_insensitive      — on a chapter-less file the Chapters
       row is present but bound to ctx.noop
       (disabled, not hidden);
@@ -53,10 +53,11 @@ NOTHING any more.  Gates (brief §C token names verbatim):
       generated into scratch/ (320x240, 3
       chapters, 2 audio tracks, 1 subtitle)
       — never into testdata/;
-  * opened_menu_has_all_7_entries_in_order /
-    opened_menu_entries_wired        — with the popover OPEN, the seven
-      entries are read from the model THIS popover paints (its
-      `get_menu_model()`), in order, every leaf carrying a ctx.* action;
+  * opened_menu_has_all_8_entries_in_order /
+    opened_menu_entries_wired        — with the popover OPEN, the body
+      entries (R11 adds Crop to window after Repeat) are read from the
+      model THIS popover paints (its `get_menu_model()`), in order, every
+      leaf carrying a ctx.* action;
   * menu_opens / menu_dismisses /
     window_alive_after_dismiss        — a real button-3 press paints the
       popover, a real XTEST Escape closes it,
@@ -307,9 +308,13 @@ def base_schedule(app):
         while k is not None:
             kids += 1
             k = k.get_next_sibling()
+        # R12: 6 children = BASE (window handle -> GLArea) + 5 overlays:
+        # the TOP CHROME strip (title + window controls, an OVERLAY child,
+        # not a titlebar bar) + preview + osd + toast + bottom bar.  The
+        # deleted top menu bar is STILL absent for every config.
         check("top_bar_absent",
               not mb and not dead_btns and not named and chrome_gone
-              and kids == 5,
+              and kids == 6,
               f"menubuttons={len(mb)} dead={dead_btns} named={len(named)} "
               f"chrome_attrs_gone={chrome_gone} overlay_kids={kids}")
         check("bottom_bar_survives",
@@ -340,9 +345,10 @@ def base_schedule(app):
         w = win()
         rows = ctxmenu.model_dump(ctxmenu.build(w.core.snapshot))
         labels = [r[0] for r in rows]
-        check("menu_has_all_7_entries_in_order",
+        check("menu_has_all_8_entries_in_order",
               labels == ["perf_1080p30.mp4", "Audio", "Subtitles", "Repeat",
-                         "Playlist", "Chapters", "Tracks"], str(labels))
+                         "Crop to window", "Playlist", "Chapters",
+                         "Tracks"], str(labels))
         ch = [r for r in rows if r[0] == "Chapters"]
         check("chapters_present_insensitive",
               len(ch) == 1 and ch[0][1] == "ctx.noop", str(ch))
@@ -599,7 +605,8 @@ def base_schedule(app):
 
     def s_opened_menu():
         """The brief's wording, literally: the menu is OPEN (button press
-        path, popover visible right now) and the seven entries are read out
+        path, popover visible right now) and the body entries (R11 adds
+        Crop to window after Repeat) are read out
         of the model THIS popover paints — `get_menu_model()`, not a freshly
         built copy — in paint order, each one carrying a real ctx.* action.
         A disabled entry is one bound to ctx.noop: present but inert, which
@@ -612,9 +619,10 @@ def base_schedule(app):
                                        type(model).__name__))
         rows = ctxmenu.model_dump(model)
         labels = [r[0] for r in rows]
-        check("opened_menu_has_all_7_entries_in_order",
+        check("opened_menu_has_all_8_entries_in_order",
               labels == ["perf_1080p30.mp4", "Audio", "Subtitles", "Repeat",
-                         "Playlist", "Chapters", "Tracks"], str(labels))
+                         "Crop to window", "Playlist", "Chapters",
+                         "Tracks"], str(labels))
 
         def leaves(rs):
             out = []

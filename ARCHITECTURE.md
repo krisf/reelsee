@@ -74,6 +74,14 @@ folder monitor appends new files (250 ms debounce).
 
 ## Chrome (`chrome.py`, `window.py`)
 
+Since 0.2.0 the bars are a **zero-space overlay**: the video surface always
+fills the client area and the bars float above it, so a reveal can never
+resize or re-letterbox the picture. Any change that gives a bar a layout slot
+is a regression, and the `overlaychrome` gate is in the battery for that
+reason. The idle countdown also guards against tick gaps (a suspend/resume
+must not resurrect hidden chrome) — hidden means hidden until pointer motion.
+
+
 `ChromeState` is a pure state machine (`R-3`, Looksee parity): hidden only
 while playing; pause, stop and EOF force it visible; pointer motion reveals;
 a monotonic clock drives the idle timeout so injected IO latency cannot
@@ -94,6 +102,12 @@ Two independent mechanisms, both pure-tested before they touch a widget:
   ~80 ms debounce keep a fast drag from storming; fullscreen, maximized and
   unknown-aspect states leave resizing completely free. A newly loaded video
   fits its own aspect inside 80 % of the work area.
+* **Crop to window** — a persistent boolean (`video.crop_to_window`) that
+  rides mpv's `panscan=1.0`: the picture covers the window and the overflow is
+  clipped. While it is on, the aspect lock is suspended through a single
+  decision point (`aspect_lock_active`), because "keep the video's aspect" and
+  "fill and clip" are contradictory instructions; turning crop off re-arms the
+  lock.
 * **Remembered geometry and cascading** — the last windowed rect is stored
   (debounced 250 ms, flushed on close/quit, never a fullscreen rect) and a new
   window opens at *exactly* that size, offset ±50 px with the direction chosen

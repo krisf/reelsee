@@ -254,7 +254,10 @@ def base_schedule(app, phase):
               labels[:1] == ["perf_1080p30.mp4"]
               and rows[0][1] == "ctx.noop", str(rows[:1]))
         check("menu_body_order",
-              labels[1:] == ["Audio", "Subtitles", "Repeat", "Playlist",
+              # R11: "Crop to window" slots in directly after Repeat (the
+              # brief's placement); every other entry/order is unchanged.
+              labels[1:] == ["Audio", "Subtitles", "Repeat",
+                             "Crop to window", "Playlist",
                              "Chapters", "Tracks"], str(labels))
         by = {r[0]: r for r in rows}
         check("audio_submenu_present",
@@ -405,7 +408,8 @@ def base_schedule(app, phase):
             labels = [r[0] for r in rows]
             check("menu_identical_without_top_menu",
                   labels == ["perf_1080p30.mp4", "Audio", "Subtitles",
-                             "Repeat", "Playlist", "Chapters", "Tracks"],
+                             "Repeat", "Crop to window", "Playlist",
+                             "Chapters", "Tracks"],
                   str(labels))
             p = shot("menu-topmenu-off")
             check("phase2_shot", p.exists(), str(p))

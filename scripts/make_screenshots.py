@@ -89,13 +89,22 @@ def env(home: Path) -> dict:
              XDG_DATA_HOME=str(home / "data"),
              GDK_BACKEND="x11", GSETTINGS_BACKEND="memory",
              LIBGL_ALWAYS_SOFTWARE="1", NO_AT_BRIDGE="1",
-             REELSEE_SCREENSHOT="1")
+             REELSEE_SCREENSHOT="1",
+             # config_dir()/state_dir() read ~/.config and ~/.local/state and
+             # IGNORE XDG_CONFIG_HOME/XDG_STATE_HOME, so writing into
+             # $HOME/config used to land where nothing ever looked: the app
+             # silently ran on defaults and every "setting" a shot asked for
+             # was a fiction. These are the app's own documented overrides.
+             REELSEE_CONFIG_DIR=str(home / "config"),
+             REELSEE_STATE_DIR=str(home / "state"))
     e.pop("WAYLAND_DISPLAY", None)
     return e
 
 
 def write_cfg(home: Path, overrides: dict) -> None:
-    cfg_dir = home / "config" / "reelsee"
+    # REELSEE_CONFIG_DIR names the directory itself (config_dir() does not
+    # append "reelsee"), so the file goes directly inside it.
+    cfg_dir = home / "config"
     cfg_dir.mkdir(parents=True, exist_ok=True)
     (cfg_dir / "config.json").write_text(json.dumps(overrides, indent=2))
 
@@ -185,11 +194,13 @@ def pick_win(wins, want: str):
 
 def shot(name: str, clip: Path, cfg: dict, act=None, warm: float = 4.0,
          pad: int = 0, pick: str = "largest", reveal: bool = False,
-         act_delay: float = 1.0) -> bool:
+         act_delay: float = 1.0, pre=None) -> bool:
     home = SCR / f"home-{name}"
     shutil.rmtree(home, ignore_errors=True)
     home.mkdir(parents=True)
     write_cfg(home, cfg)
+    if pre:
+        pre(home)
     proc = subprocess.Popen([PY, str(ROOT / "src" / "reelsee.py"), str(clip)],
                             env=env(home), stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
@@ -247,6 +258,22 @@ def main() -> int:
     ok["settings"] = shot("settings", clips["bars_1080.mp4"], slow,
                           act=open_settings, pad=0, pick="Settings",
                           reveal=True)
+
+    # Crop-to-window needs a window whose aspect contradicts the clip, which
+    # only the remembered geometry can give us: seed a tall rect into
+    # <state>/window.json (the same file R10 writes) and let the app restore
+    # it. Aspect lock is what normally refuses such a window; crop suspends
+    # it, so this picture is the feature.
+    def seed_tall(home: Path) -> None:
+        d = home / "state"   # = REELSEE_STATE_DIR, set in env()
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "window.json").write_text(json.dumps(
+            {"rect": {"x": 60, "y": 40, "w": 460, "h": 780}}))
+
+    crop_cfg = {"ui": {"chrome_timeout_ms": 120000, "lock_aspect": True},
+                "video": {"crop_to_window": True}}
+    ok["crop"] = shot("crop", clips["fractal.mp4"], crop_cfg, pre=seed_tall,
+                      reveal=True)
 
     print("summary:", json.dumps(ok))
     return 0 if all(ok.values()) else 1

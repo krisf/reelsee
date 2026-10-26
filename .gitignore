@@ -2,3 +2,7 @@ scratch/
 __pycache__/
 *.pyc
 buildout/
+vendor/
+
+# private identifiers for the mint sweep — never committed
+scripts/leak-patterns.txt

@@ -177,18 +177,20 @@ def run(argv: list[str] | None = None, on_app=None) -> int:
     gi.require_version("Gtk", "4.0")
     from gi.repository import Gio, Gtk
 
-    # R5-A: the headerbar owns the real window controls (the old CSD title
-    # bar is replaced by an Adw.HeaderBar).  Desktops with trimmed
-    # decoration layouts (GNOME default: close only) would otherwise hide
-    # the full minimize/maximize/close set this UI is specified around.
+    # R12: the window controls are OUR OWN buttons in the top overlay
+    # strip (see window._build_top_chrome), so this pinned layout is a
+    # belt-and-braces default rather than the mechanism — kept because
+    # desktops with trimmed decoration layouts (GNOME default: close
+    # only) should still never influence chrome look or behaviour.
     _settings = Gtk.Settings.get_default()
     if _settings is not None:
         _settings.set_property("gtk-decoration-layout",
                                ":minimize,maximize,close")
         # R5-D: the video area lives inside a Gtk.WindowHandle so the window
-        # is draggable from anywhere; its built-in titlebar behaviours (which
-        # would fire on double/right/middle-click over the VIDEO) must be off
-        # — the app owns double-click (fullscreen) and wants no window menu.
+        # is draggable from anywhere; the built-in titlebar click behaviours
+        # (which would fire on double/right/middle-click over the VIDEO)
+        # must be off — the app owns double-click (fullscreen) and wants no
+        # window menu.
         for _prop in ("gtk-titlebar-double-click",
                       "gtk-titlebar-middle-click",
                       "gtk-titlebar-right-click"):

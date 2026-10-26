@@ -33,9 +33,9 @@ def check(name: str, ok: bool, value="") -> bool:
 
 def finish() -> None:
     if failures:
-        print("SMOKE_FAILURES: " + ",".join(failures))
+        print("SMOKE_FAILURES: " + ",".join(failures), flush=True)
         sys.exit(1)
-    print("SMOKE_ASSERTS_PASSED")
+    print("SMOKE_ASSERTS_PASSED", flush=True)
 
 
 def capture_xwd(path: Path) -> bool:

@@ -3,6 +3,29 @@
 Built with `packaging/build-deb.sh`; the package depends on the distro
 `libmpv2` and ships no vendored copy by design.
 
+## 0.2.0
+
+- **Crop to window.** A stateful toggle (right-click → *Crop to window*,
+  command palette, or settings → Video) that fills the window with the video
+  and clips the overflow instead of letterboxing it: a landscape clip in a
+  tall window loses its sides, a portrait clip in a wide window loses top and
+  bottom. Aspect-locked resizing is suspended while cropping and re-armed when
+  you turn it off, and the setting persists like the others.
+- **The chrome is a zero-space overlay.** The bars no longer take layout room,
+  so the video owns the entire client area and controls float over it; hiding
+  and revealing them cannot resize the picture at all.
+- **Chrome stays hidden.** Plain idleness used to resurrect the bars on a
+  timer discontinuity; the idle countdown now survives tick gaps and a hidden
+  window stays hidden until you move the pointer.
+- Repository hygiene: the `install_paths` gate no longer references anyone's
+  real media library (it generates its own hostile paths — spaces, apostrophes,
+  `$&`, capitalised directory names — and proves the same thing), the incident
+  and round reports were genericised, packaging uses the project's public
+  identity, `vendor/` (6.3 MB of unpacked Debian libraries) is untracked as the
+  docs always claimed, and `README.md`, the screenshots,
+  `scripts/make_screenshots.py` and `scripts/make_public.sh` are now tracked, so
+  the published repository can be re-minted from a clone by one command.
+
 ## 0.1.1
 
 - **The in-video menu bar is gone.** File / Audio / Subtitles / Repeat /

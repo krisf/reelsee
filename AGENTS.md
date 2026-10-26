@@ -76,6 +76,20 @@ spike that proves the render path is kept at
 * Window *placement* is not a GTK4 capability. On X11 it is a raw Xlib
   `MoveResizeWindow`; on Wayland it is impossible by protocol, so tests
   must assert size-exactness and treat the offset as best-effort.
+* `config_dir()` and `state_dir()` resolve to `~/.config/reelsee` and
+  `~/.local/state/reelsee` and **ignore** `XDG_CONFIG_HOME` /
+  `XDG_STATE_HOME`. To point the app at a scratch home, set
+  `REELSEE_CONFIG_DIR` / `REELSEE_STATE_DIR` (they name the directory
+  itself, with no `reelsee/` suffix). Writing config somewhere else is
+  silent: the app starts on defaults and every setting you thought you
+  applied is fiction — this cost a screenshot that showed the opposite
+  of the feature it advertised.
+* The bars are an **overlay with no layout slot** (0.2.0). If a bar is
+  given a real allocation, revealing it resizes the video — visually a
+  flicker, mechanically a re-init. `overlaychrome` gates this.
+* Crop-to-window and aspect lock are **mutually exclusive by design**;
+  read the state through `aspect_lock_active`, never by re-reading
+  `ui.lock_aspect` directly.
 * Chrome visibility is a state machine (`src/chrome.py::ChromeState`), not a
   timer in the widget: hidden **only** while playing; pause, stop, EOF and
   any pointer motion show it again. Drive it with a monotonic clock so

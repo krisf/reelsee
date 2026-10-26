@@ -6,8 +6,29 @@ is rendered by an in-process OpenGL pipeline: libmpv draws frames into an
 FBO owned by a `GtkGLArea`, so decoding, GPU selection and every mpv option
 are first-class citizens of one small Python application.
 
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
+![GTK 4](https://img.shields.io/badge/GTK-4-E24E42)
+![libmpv 0.41](https://img.shields.io/badge/libmpv-0.41-579D35)
+![mpv engine](https://img.shields.io/badge/mpv%20engine-embedded%20via%20libmpv-informational)
+
+## What it looks like
+
+| | |
+|---|---|
+| ![chrome revealed](docs/screenshots/hero.png) | **Chrome revealed.** The bars float *over* the picture — the video always owns the whole window. Transport bar: play/pause, prev/next, `A`/`B` repeat points, position, seek, duration, repeat, speed, volume, mute, plus the live **GPU/CPU decode badge** at the right end. Media menus open on right-click. |
+| ![chrome retracted](docs/screenshots/clean.png) | **Chrome retracted.** A few seconds of pointer idle and every control — title bar included — fades out and nothing comes back until you move the mouse. Same idle behaviour as its sibling image viewer, Looksee. |
+| ![settings](docs/screenshots/settings.png) | **Settings.** Seven pages (Playback, Audio, Video, **Decode & GPU**, Subtitles, Interface, Advanced mpv). Everything applies live; *Advanced mpv* exposes the remaining raw libmpv options, searchable and persisted. |
+
+Captured from the app itself over the synthetic clips in `testdata/`, headless under Xvfb, at the geometry the app actually chose:
+under Xvfb: `xvfb-run -a /usr/bin/python3 scripts/make_screenshots.py`. The
+right-click menu has no screenshot on purpose — GTK dismisses popups on
+focus-out and Xvfb has no compositor, so that capture is not reproducible.
+
+
 ```
 /usr/bin/python3 src/reelsee.py <file|folder|URL> [...]
+| ![crop to window](docs/screenshots/crop.png) | **Crop to window.** The clip is 1920x1080 and this window is 460x780, restored from the remembered geometry. Normally the aspect lock refuses such a window; with crop on, the picture *covers* it and the sides are clipped — no letterbox anywhere. |
 ```
 
 From a checkout, libmpv is resolved automatically: `REELSEE_LIBMPV`,
@@ -40,12 +61,13 @@ bracketed column tells where it lives.
 | Video track | select / audio-only mode (`vid=no`) | right-click → Tracks, settings → Playback |
 | Subtitles | track select, external `.srt/.ass…` file, delay, scale, visibility, styling preset (font / size / color / border / margin) | right-click → Subtitles, `v`, `t`, settings → Subtitles |
 | Geometry | aspect override, zoom, pan-x/y, rotate, crop | settings → Video |
+| Crop to window | **fill the window and clip the overflow** instead of letterboxing: landscape in a tall window loses its sides, portrait in a wide window loses top/bottom; suspends aspect lock while on, persists | right-click → Crop to window, palette `win.crop-to-window`, settings → Video (`video.crop_to_window`) |
 | Aspect lock | **resize the window and it keeps the video's own aspect** — landscape and portrait both work (GTK4 has no geometry hints, so it corrects from `Gdk.Surface::layout`) | `ui.lock_aspect`, palette `win.toggle-aspect-lock`, settings → Interface |
 | Equalizer | brightness / contrast / saturation / gamma / hue | settings → Video |
 | Quality | scale presets (default/fast/high/higher → `scale/cscale/dscale`), deband, dither depth, interpolation, tscale | settings → Video |
 | Deinterlace | auto / yes / no | settings → Video |
 | Screenshots | png/jpg + directory + quality; optional clipboard copy | `s`, settings → Interface |
-| Window | fullscreen (F11), leave-Fullscreen (Esc), always-on-top, custom title format (`${media-title}` / `${filename}`); last window size & position remembered across launches (`ui.remember_geometry`, never a fullscreen rect); new windows cascade beside the current one at its exact size (`ui.cascade_offset_px`, flips at the screen edge, 0 = exactly on top) — positioning is an X11 capability, so on Wayland the packaged `.desktop` pins `GDK_BACKEND=x11` (environment-overridable) and native Wayland degrades to size-only cascades | `f`, Esc, settings → Interface |
+| Window | chrome is a **zero-space overlay** — the video owns the whole client area and the bars float over it, so revealing them never resizes the picture; fullscreen (F11), leave-Fullscreen (Esc), always-on-top, custom title format (`${media-title}` / `${filename}`); last window size & position remembered across launches (`ui.remember_geometry`, never a fullscreen rect); new windows cascade beside the current one at its exact size (`ui.cascade_offset_px`, flips at the screen edge, 0 = exactly on top) — positioning is an X11 capability, so on Wayland the packaged `.desktop` pins `GDK_BACKEND=x11` (environment-overridable) and native Wayland degrades to size-only cascades | `f`, Esc, settings → Interface |
 | Resume | resume position per file in **our** `resume.json` (never mpv's `--resume-playback`) | automatic (`playback.resume`, `resume_min_s`) |
 | Decode | hardware decode + GPU pin + CPU decode + overload watchdog (auto drop to `hwdec=no`) | settings → Advanced; auto round-robin across GPUs |
 | Playlist | add file/folder, remove, reorder, shuffle, save/load `.m3u`, next/prev, natural sort, folder live-refresh | right-click → Playlist, `n` / `b` |
@@ -165,8 +187,8 @@ player itself never spawns mpv).
 ## Build & install
 
 ```
-packaging/build-deb.sh            # → buildout/reelsee_0.1.0_all.deb
-sudo apt install buildout/reelsee_0.1.0_all.deb
+packaging/build-deb.sh            # → buildout/reelsee_0.2.0_all.deb
+sudo apt install ./buildout/reelsee_0.2.0_all.deb
 ```
 
 The package installs `/usr/bin/reelsee` (a shell wrapper), the Python
@@ -221,12 +243,10 @@ results that looked like success.
 Shipped and gated: embedded-render playback, per-GPU decode pinning with
 engagement verification and the CPU-fallback watchdog, A/B section repeat,
 mute/volume/resume persistence, the deleted top bar with media menus on
-right-click, aspect-locked resize, remembered geometry with exact-size
-cascading, and repeat that survives reload/restart. See
+right-click, aspect-locked resize, crop-to-window,
+zero-space overlay chrome, remembered geometry with exact-size cascading, and
+repeat that survives reload/restart. See
 [CHANGELOG.md](CHANGELOG.md).
-
-Next up: **crop to window** — fill the window and hide the overflow, so a
-landscape video in a portrait window loses its sides instead of getting bars.
 
 Design rationale, requirement ids and the appendix proofs:
 [docs/DESIGN.md](docs/DESIGN.md). Constraints for coding agents:

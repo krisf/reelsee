@@ -41,9 +41,32 @@ from pathlib import Path
 
 from smoke_harness import ROOT as REPO, SCRATCH, check, finish
 
+import glob
+
 import mpvlib
 
-DEB = os.path.join("buildout", "reelsee_0.1.0_all.deb")
+def _canonical_version():
+    """Version comes from packaging/DEBIAN/control -- the single source of truth.
+
+    This gate used to hardcode both the deb filename AND the expected control
+    Version as 0.1.0, so the whole battery went red the moment the project
+    bumped to 0.1.1.  A gate must verify the package, not pin a release.
+    """
+    try:
+        with open(os.path.join("packaging", "DEBIAN", "control")) as fh:
+            for line in fh:
+                if line.startswith("Version:"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+PKG_VERSION = _canonical_version()
+_candidates = sorted(glob.glob(os.path.join("buildout", "reelsee_*_all.deb")),
+                     key=lambda p: os.path.getmtime(p))
+DEB = _candidates[-1] if _candidates else os.path.join(
+    "buildout", f"reelsee_{PKG_VERSION or '0.0.0'}_all.deb")
 ROOT = os.path.join(SCRATCH, "pkg-root")
 PY = "/usr/bin/python3"
 PROBE = os.path.join(REPO, "scripts", "pkg_launch_probe.py")
@@ -156,7 +179,8 @@ def main() -> int:
             ctrl.setdefault(k, v)
     check("control_fields",
           ctrl.get("Package") == "reelsee"
-          and ctrl.get("Version") == "0.1.0"
+          and PKG_VERSION is not None
+          and ctrl.get("Version") == PKG_VERSION
           and ctrl.get("Architecture") == "all"
           and "libmpv2" in ctrl.get("Depends", "")
           and "python3-gi" in ctrl.get("Depends", "")

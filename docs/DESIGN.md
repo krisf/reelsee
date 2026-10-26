@@ -1,7 +1,9 @@
 # REELSEE — design document (as built)
 
 > Written before the first line of code; kept because docstrings, test
-> names and gates cite its section numbers (`PLAN §4.6`, `R-5`, `P0`…`P12`).
+> names and gates cite its section numbers (`PLAN §4.6`, `R-5`,
+> `P0`…`P12`). Deviating from a rule here means updating the rule *and*
+> its gate, not just the code.
 
 # PLAN.md — REELSEE: greenfield GTK4 video player (libmpv frontend, Looksee's sister app)
 Dispatch model: whole-build single-run via DeepSeek Harness (dsh alias `qwen3.8-27b` @ 127.0.0.1:8180).
@@ -558,7 +560,7 @@ A gate that fails twice → `REELSEE_PHASE_n_BLOCKED` + the failing command and 
   Gate: both lints green over `src/`; smoke with `REELSEE_FAKE_LATENCY_MS=3000` shows the
   window within 400 ms and heartbeat p95 < 50 ms during the delay
   (`SMOKE_CHECK:ui_alive_during_slow_io=true`). → `REELSEE_P9_DONE`
-- **P10 packaging** — `packaging/build-deb.sh` → `buildout/reelsee_0.1.0_all.deb`,
+- **P10 packaging** — `packaging/build-deb.sh` → `buildout/reelsee_<version>_all.deb`,
   desktop file (MIME list from `mpv.desktop`), SVG icon, wrapper, copyright, docs.
   Gate: `.deb` exists; `dpkg-deb -I` parses with contract fields; `dpkg-deb -c` lists ≥6
   expected paths; desktop entry parses via `configparser` with non-empty

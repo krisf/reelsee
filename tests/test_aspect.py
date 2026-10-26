@@ -326,6 +326,9 @@ class _AspectWin:
         self.chrome = _Chrome()
         self._closing = False
         self._fs = False
+        # R11-C: _aspect_locked now asks aspect.aspect_lock_active, which
+        # reads the crop suspension; this fake never crops.
+        self._crop_on = False
         self._aspect_free_until = 0.0
         self._aspect_size = size
         self._aspect_surf = None
