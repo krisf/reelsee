@@ -164,6 +164,16 @@ def run(argv: list[str] | None = None, on_app=None) -> int:
         format="%(levelname)s %(name)s: %(message)s")
     argv = list(sys.argv if argv is None else argv)
 
+    import config
+    try:
+        # R15-B: one-time config migrations (the repeat-on flip) run
+        # BEFORE Config() first reads the file — and must never block
+        # the boot; a failed migration is a logged, visible no-op.
+        config.run_migrations()
+    except Exception:                          # noqa: BLE001
+        logging.getLogger("reelsee").exception(
+            "config migration failed — continuing on the stored file")
+
     from config import Config
     cfg = Config()
 
@@ -227,12 +237,18 @@ def run(argv: list[str] | None = None, on_app=None) -> int:
             self.registry = WindowRegistry()      # §4.10 multi-window policy
             self._engine_list = None
             self._focused = None
+            # R16-D: focus recency counter and the once-per-session flag for
+            # the decode-plan toast (§D.2: a demotion is never silent).
+            self._focus_seq = 0
+            self._plan_toast = False
 
         # ------------------------------------------------------- focus policy
         def on_window_focus(self, w):
             """R-audio: only the focused window keeps audio (transient mute
             on the others) while audio.focus_mute is on."""
             self._focused = w
+            self._focus_seq += 1
+            w._focus_seq = self._focus_seq
             if not bool(cfg.get("audio.focus_mute", True)):
                 return
             for other in self.registry.focus_plan(w, True):
@@ -309,15 +325,24 @@ def run(argv: list[str] | None = None, on_app=None) -> int:
 
         # ------------------------------------------------------------ opening
         def _engine_choice(self):
-            """P8 round-robin: with engine.decoder == auto each new window
-            gets the next distinct GPU (display first); pinned decoders
-            route through the config path unchanged."""
+            """Engine for the next window.  R16-D: with engine.decoder == auto
+            the choice is the DECODE PLAN (integrated iGPU up to
+            engine.decode_capacity, CPU beyond; never a dGPU), not a
+            round-robin over every GPU in the machine.  A pinned decoder
+            routes through the config path unchanged.
+
+            R16-E §E.2: `playback.vaapi_device` pins the CARD the plan uses
+            (it may name a dGPU — a human chose it) while the plan still
+            decides how many windows decode on it."""
             if str(cfg.get("engine.decoder", "auto") or "auto") != "auto":
                 return None
             if self._engine_list is None:
                 self._engine_list = engine.enumerate_engines()
-            return self.registry.pick_engine("auto", self._engine_list,
-                                             engine.select_engine)
+            return self.registry.pick_engine(
+                "auto", self._engine_list, engine.select_engine,
+                capacity=int(cfg.get("engine.decode_capacity",
+                                     engine.DECODE_CAPACITY) or 0),
+                pin=engine.vaapi_device_pin(cfg))
 
         def _spawn_window(self, present: bool = True) -> ReelseeWindow:
             w = ReelseeWindow(self, cfg, self.lib,
@@ -333,6 +358,7 @@ def run(argv: list[str] | None = None, on_app=None) -> int:
                 w.adopt_geometry(plan[1])
             self.windows.append(w)
             self.registry.add(w)
+            self.retune_decode_threads()       # R16-C: N windows, one budget
             if present:
                 w.present()
                 if plan is not None:
@@ -346,6 +372,69 @@ def run(argv: list[str] | None = None, on_app=None) -> int:
                 if not w._closing:
                     return w
             return None
+
+        # ------------------------------------------------- R16-C decode budget
+        def retune_decode_threads(self) -> None:
+            """Recompute the CPU decode budget for every LIVE window.
+
+            `vd-lavc-threads` used to be decided once, at window open, from
+            the count at that instant — so opening a second window left the
+            first one still asking lavc for the whole machine.  The budget is
+            a pure function (engine.threads_for, unit-tested truth table);
+            this is the one place that knows how many windows are live.
+
+            Only CPU-decoded windows are written (window.apply_thread_budget
+            checks the OBSERVED hwdec-current), so GPU windows are untouched.
+            A window that just opened has no hwdec-current yet and is covered
+            by its own init options, which already used the post-open count."""
+            live = [w for w in getattr(self, "windows", ()) if not w._closing]
+            threads = engine.cpu_thread_count(cfg, len(live))
+            for w in live:
+                try:
+                    w.apply_thread_budget(threads)
+                except Exception:               # noqa: BLE001
+                    logging.getLogger("reelsee").exception(
+                        "thread retune failed for one window")
+
+        # ------------------------------------------------- R16-D decode plan
+        def enforce_decode_plan(self) -> None:
+            """The decode GPU carries at most `engine.decode_capacity` streams.
+
+            When a session exceeds that, the window that gained focus LAST is
+            demoted to CPU (§D.2) — the plan's choice, not whichever window
+            happens to trip its own overload watchdog.  A window the user
+            pinned to a decoder by hand is never a candidate: the per-video
+            GPU/CPU toggle always overrides the plan for its window.
+
+            A demotion is never silent.  The first one in a session toasts;
+            after that the toast is suppressed (§D.2: "one-time-per-session")
+            and the demotion is only logged, so a window that flaps back and
+            forth cannot spam the user."""
+            from registry import demotion_target
+            live = [w for w in getattr(self, "windows", ()) if not w._closing]
+            cap = int(cfg.get("engine.decode_capacity",
+                              engine.DECODE_CAPACITY) or 0)
+            victim = demotion_target(live, cap)
+            if victim is None:
+                return
+            victim.demote_to_cpu(f"over capacity ({cap})")
+            if not self._plan_toast:
+                self._plan_toast = True
+                try:
+                    victim.chrome.show_toast(
+                        f"Decode capacity ({cap}) reached — this window "
+                        "decodes on the CPU")
+                except Exception:               # noqa: BLE001
+                    logging.getLogger("reelsee").exception(
+                        "decode-plan toast failed")
+
+        def on_decode_state_changed(self, win) -> None:
+            """A window's OBSERVED decoder changed (the hwdec-current edge in
+            window._on_snapshot).  Both multi-window decode policies are
+            functions of who is decoding where, so both are recomputed here:
+            the CPU thread budget, and the GPU stream cap."""
+            self.retune_decode_threads()
+            self.enforce_decode_plan()
 
         def do_activate(self):  # noqa: N802 (GTK virtual)
             if self._opened:
@@ -391,6 +480,7 @@ def run(argv: list[str] | None = None, on_app=None) -> int:
             if w in self.windows:
                 self.windows.remove(w)
             self.registry.remove(w)
+            self.retune_decode_threads()       # R16-C: survivors get the share
             # render context was already detached+freed with GL current
             # (window close, §0.6) — terminate mpv on a WORKER so the main
             # loop never stalls (§4.11).

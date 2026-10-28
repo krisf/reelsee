@@ -158,7 +158,17 @@ def main() -> int:
                   and w._handle.get_child() is w.view.area,
                   f"base={type(w.overlay.get_child()).__name__} "
                   f"handle_child_is_glarea={w._handle.get_child() is w.view.area}")
-            kids = (w.top_bar.get_parent() is w.overlay,
+            # R15-A premise update (own commit): the top strip now rides
+            # inside a Gtk.WindowHandle — the HANDLE is the overlay child
+            # and the strip's parent is the handle, not the overlay.  The
+            # contract this gate guards (every chrome hangs off THE ONE
+            # overlay, no layout slot) is unchanged; the chain just has
+            # one honest extra link for the strip.
+            tb = w.top_bar.get_parent()
+            top_is_overlay_child = (
+                tb is w.overlay or (tb is getattr(w, "_top_handle", None)
+                                    and tb.get_parent() is w.overlay))
+            kids = (top_is_overlay_child,
                     w.chrome.bottom.get_parent() is w.overlay,
                     w.chrome.osd.get_parent() is w.overlay,
                     w.chrome.preview.get_parent() is w.overlay,

@@ -214,3 +214,70 @@ def needs_correction(w, h, aspect, eps: int = EPS_PX, max_w=None, max_h=None,
     if a is None or a <= 0:
         return False
     return max(abs(fit[0] - int(w)), abs(fit[1] - int(h))) > eps
+
+
+# ---------------------------------------------------------------- PAspect
+#: Ceiling for the numerator/denominator we are willing to publish in
+#: WM_NORMAL_HINTS.  The fields are 32-bit and a correct WM uses them
+#: exactly, but ratios like 3840x2160 reduce to 16:9 anyway; anything whose
+#: exact reduction exceeds this many pixels of "scale" is a non-obvious
+#: ratio (a weird dwidth from a filter or a rotate) and belongs in a
+#: continued-fraction convergent instead — WMs and old tools have been
+#: observed mis-multiplying huge aspect words.
+PASPECT_MAX_DEN = 1000
+
+#: Pixel error a published ratio is allowed to introduce, measured against
+#: a ``PASPECT_REF_PX``-tall window.  1 px at 4K: 16:9 and 9:16 hold to
+#: within one pixel of the true display ratio even at the largest window
+#: this app sizes, so the post-hoc §R8-B correction never has anything to
+#: say once a WM has honoured the hints.
+PASPECT_TOL_PX = 1.0
+PASPECT_REF_PX = 4096
+
+
+def paspect_pair(dwidth, dheight, max_den: int = PASPECT_MAX_DEN,
+                 tol_px: float = PASPECT_TOL_PX,
+                 ref_px: float = PASPECT_REF_PX) -> tuple[int, int] | None:
+    """``(num, den)`` for the X11 PAspect words, or None = nothing to lock.
+
+    The pair must express ``dwidth / dheight`` closely enough that a WM
+    honouring the hints needs no post-correction: exactly, when the
+    greatest-common-divisor reduction is small enough (1920x1080 →
+    ``(16, 9)``, 270x480 → ``(9, 16)``); otherwise the best
+    continued-fraction convergent whose numerator and denominator are both
+    within ``max_den`` AND whose error stays under ``tol_px`` pixels on a
+    ``ref_px``-tall window.  A ratio no small pair can promise that close
+    is published EXACT and unreduced (a 32-bit field swallows it, and
+    exact-beats-tidy) — never None, unless the size itself is unknown.
+    """
+    w, h = _num(dwidth), _num(dheight)
+    if w is None or h is None or w <= 0 or h <= 0:
+        return None
+    wi, hi = int(w), int(h)
+    a, b = wi, hi
+    while b:                                   # Euclid; exact reduction
+        a, b = b, a % b
+    num, den = max(1, wi // a), max(1, hi // a)
+    if num <= max_den and den <= max_den:
+        return (num, den)
+    target = wi / hi
+    # Continued-fraction convergents, ascending denominators; keep the last
+    # one that is both small enough and accurate enough.
+    best = None
+    h0, k0, h1, k1 = 0, 1, 1, 0
+    x = target
+    for _ in range(64):                        # CF of a double terminates
+        ai = int(x)
+        h2, k2 = ai * h1 + h0, ai * k1 + k0
+        if k2 > max_den or h2 > max_den:
+            break
+        if abs(h2 / k2 - target) * ref_px <= tol_px:
+            best = (h2, k2)
+        h0, k0, h1, k1 = h1, k1, h2, k2
+        frac = x - ai
+        if frac <= 1e-12:
+            break
+        x = 1.0 / frac
+    if best is not None:
+        return best
+    return (wi, hi)                            # exact wins over tidy

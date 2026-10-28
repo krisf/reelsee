@@ -122,6 +122,11 @@ class Sample:
     drop: int
     dec_drop: int
     hwdec: str | None = None
+    # R17-D: buffering state, observed-only (mpvcore's OBSERVED_BASE —
+    # never a synchronous getter).  APPENDED at the end so every existing
+    # positional Sample(...) construction keeps working.
+    paused_for_cache: bool = False
+    cache_buffering_state: int | None = None
 
     def skip(self) -> bool:
         # Fully-ignored samples.  hwdec "no" is NOT skipped here: Appendix C
@@ -130,6 +135,34 @@ class Sample:
         # "never demote while hwdec_current is already no" holds either way.
         return (self.pause or self.seeking or self.idle or self.eof
                 or not self.playing or not self.container_fps)
+
+    def buffering(self) -> bool:
+        """R17-D: this sample was taken while mpv was still filling its
+        cache — see `is_buffering`."""
+        return is_buffering(self.paused_for_cache, self.cache_buffering_state)
+
+
+def is_buffering(paused_for_cache, cache_buffering_state) -> bool:
+    """R17-D: "the file is still buffering" — mpv is either paused for
+    cache (`paused-for-cache`) or still filling its initial cache
+    (`cache-buffering-state` < 100, the percentage mpv reports).
+
+    EITHER signal is enough: mpv re-pauses and resumes around cache
+    refills, so `paused-for-cache` can flicker to false mid-buffering while
+    the fill percentage is still climbing — and a stream that has already
+    finished its fill can still pause for cache later.  A missing
+    (`None`) percentage means "not observed yet", which is NOT buffering:
+    treating unknown as buffering would freeze the watchdog forever on a
+    build/source that never emits the property.
+    """
+    if bool(paused_for_cache):
+        return True
+    if cache_buffering_state is None:
+        return False
+    try:
+        return float(cache_buffering_state) < 100.0
+    except (TypeError, ValueError):
+        return False
 
 
 def ratios(s: Sample, prev: Sample, dt: float):
@@ -226,6 +259,20 @@ class Watchdog:
             self._streak = 0
             return None
         if now < self._grace_until or s.skip():
+            return None
+        if s.buffering():
+            # R17-D: NEVER demote while the file is still buffering.  The
+            # sample is not counted at all — the confirm streak neither
+            # increments (a buffering stall is not overload) nor resets
+            # (a startup buffer-fill must not wash out a real overload
+            # streak, and a real overload interrupted by a buffering gap
+            # still demotes once it resumes).  `_prev` was already updated
+            # above, so the next non-buffering sample measures its delta
+            # against the newest sample rather than against a stale one.
+            log.debug("watchdog: buffering sample (paused-for-cache=%s "
+                      "cache-buffering-state=%s) — streak frozen at %d",
+                      s.paused_for_cache, s.cache_buffering_state,
+                      self._streak)
             return None
         base = mode_base(s.hwdec)
         if base == "no" and (self._cfg_cpu
@@ -370,7 +417,13 @@ class Sampler:
             container_fps=snap.get("container-fps"),
             drop=int(snap.get("frame-drop-count") or 0),
             dec_drop=int(snap.get("decoder-frame-drop-count") or 0),
-            hwdec=snap.get("hwdec-current"))
+            hwdec=snap.get("hwdec-current"),
+            # R17-D: observed buffering state (OBSERVED_BASE in mpvcore —
+            # this reads the snapshot, never a getter).
+            paused_for_cache=bool(snap.get("paused-for-cache")),
+            cache_buffering_state=(
+                None if snap.get("cache-buffering-state") is None
+                else int(snap.get("cache-buffering-state"))))
 
 
 class EngagementWatcher:
@@ -397,20 +450,41 @@ class EngagementWatcher:
         self.clock = clock
         self.armed = False
         self._deadline = 0.0
+        # R17-D: the instant of the last feed, so a buffering gap can be
+        # SUBTRACTED from the deadline instead of being charged to it.
+        self._last_feed: float | None = None
 
     def arm(self, now: float | None = None) -> None:
         self.armed = True
-        self._deadline = (self.clock() if now is None else now) + self.WATCH_S
+        t = self.clock() if now is None else now
+        self._deadline = t + self.WATCH_S
+        self._last_feed = t
 
     def disarm(self) -> None:
         self.armed = False
 
-    def feed(self, observed, now: float | None = None) -> dict | None:
+    def feed(self, observed, now: float | None = None,
+             buffering: bool = False) -> dict | None:
         """observed = snapshot hwdec-current (string|None).  Returns the
-        action dict on state transitions, else None."""
+        action dict on state transitions, else None.
+
+        R17-D: `buffering=True` (mpv still filling its cache) FREEZES the
+        deadline — the elapsed gap is added back to it instead of being
+        charged against the engine.  A GPU engine that engages late only
+        because the file was still buffering is not an engagement failure;
+        the timeout must measure time spent waiting on a DECODER, not time
+        spent waiting on the network.
+        """
         if not self.armed:
             return None
         now = self.clock() if now is None else now
+        if buffering:
+            gap = 0.0 if self._last_feed is None else max(0.0,
+                                                          now - self._last_feed)
+            self._deadline += gap
+            self._last_feed = now
+            return None
+        self._last_feed = now
         base = mode_base(observed)
         if base in ENGAGED_MODES:
             self.armed = False

@@ -242,6 +242,47 @@ class MismatchAndWorkArea(unittest.TestCase):
         self.assertEqual(aspect.fit_in_workarea(0, 0, 16 / 9), (0, 0))
 
 
+class PAspectPair(unittest.TestCase):
+    """The X11 PAspect words (R14-B): small integers, exact where exact
+    is small, convergent where it is not, None only when there is no
+    display size."""
+
+    def test_canonical_ratios_reduce_exactly(self):
+        self.assertEqual(aspect.paspect_pair(1920, 1080), (16, 9))
+        self.assertEqual(aspect.paspect_pair(1280, 720), (16, 9))
+        self.assertEqual(aspect.paspect_pair(3840, 2160), (16, 9))
+        self.assertEqual(aspect.paspect_pair(270, 480), (9, 16))
+        self.assertEqual(aspect.paspect_pair(1080, 1920), (9, 16))
+        self.assertEqual(aspect.paspect_pair(640, 480), (4, 3))
+
+    def test_small_odd_ratio_stays_exact(self):
+        # 997:991 are primes (under the ceiling) — exact beats tidy.
+        self.assertEqual(aspect.paspect_pair(1994, 1982), (997, 991))
+        # 1918x1078 fully reduces (gcd 14) — exact and small:
+        self.assertEqual(aspect.paspect_pair(1918, 1078), (137, 77))
+
+    def test_large_ratio_becomes_an_accurate_convergent(self):
+        num, den = aspect.paspect_pair(4097, 2304)          # gcd 1, > max_den
+        self.assertLessEqual(num, aspect.PASPECT_MAX_DEN)
+        self.assertLessEqual(den, aspect.PASPECT_MAX_DEN)
+        # 1 px on a 4K-tall window, exactly the published contract:
+        self.assertLessEqual(abs(num / den - 4097 / 2304) * 4096,
+                             aspect.PASPECT_TOL_PX + 1e-9)
+
+    def test_unknown_sizes_are_none(self):
+        for w, h in ((None, 1080), (1920, None), (0, 0), (1920, 0),
+                     (-16, 9), (True, False), ("x", "y")):
+            self.assertIsNone(aspect.paspect_pair(w, h), (w, h))
+
+    def test_one_pixel_claim_on_a_4k_window(self):
+        # The brief's acceptance: at a 4K-wide window the published 16:9
+        # cannot be more than 1 px off the true display ratio's height.
+        for dw, dh in ((1920, 1080), (1080, 1920), (3840, 2160)):
+            num, den = aspect.paspect_pair(dw, dh)
+            off = abs(num * dh - den * dw) / (den * dh) * 4096
+            self.assertLessEqual(off, 1.0, (dw, dh))
+
+
 class SettingAndConfig(unittest.TestCase):
     def test_lock_aspect_defaults_true(self):
         self.assertTrue(config.DEFAULTS["ui"]["lock_aspect"])
@@ -319,6 +360,18 @@ class _AspectWin:
     _sync_aspect_action = ReelseeWindow._sync_aspect_action
     _act_aspect_lock = ReelseeWindow._act_aspect_lock
     on_setting_changed = ReelseeWindow.on_setting_changed
+    _aspect_hints_pair = ReelseeWindow._aspect_hints_pair
+
+    # R14-B seam: the hint methods' work is X property I/O (gated live by
+    # scripts/smoke_aspecthints.py); here they are RECORDED, with apply
+    # recording the same decision the real one would publish (pair or
+    # None=clear) so the eligibility wiring is still actually asserted.
+    def _aspect_hints_apply(self):
+        self.hints.append(self._aspect_hints_pair()
+                          if self._aspect_locked() else None)
+
+    def _aspect_hints_soon(self, *_a):
+        self.hints_soon += 1
 
     def __init__(self, cfg, snapshot=None, size=(1000, 1000)):
         self.cfg = cfg
@@ -341,7 +394,11 @@ class _AspectWin:
         self._aspect_applied = None
         self._aspect_corrections = 0
         self._aspect_lock_action = None
+        self._aspect_hints_id = None
+        self._aspect_hints_seen = None
         self.requests = []
+        self.hints = []          # what the R14-B seam decided (pair|None)
+        self.hints_soon = 0      # debounce requests, counted not scheduled
 
     # what a widget would answer, recorded instead of mapped
     def is_fullscreen(self):
@@ -349,6 +406,12 @@ class _AspectWin:
 
     def is_maximized(self):
         return False
+
+    def get_mapped(self):
+        # R16-B: `_on_surface_layout` and `_apply_aspect_size` are inert on an
+        # UNMAPPED surface (a minimized window must not queue a resize).  This
+        # fake models the visible window those tests are about.
+        return True
 
     def set_default_size(self, w, h):
         self.requests.append((w, h))
@@ -496,6 +559,103 @@ class TestSettingToggle(unittest.TestCase):
         self.assertIs(win._aspect_correct(), False)
         # exactly one request, computed from the NEWEST box of the burst
         self.assertEqual(win.requests, [(1200, 675)])
+
+
+class HintsDeclaration(unittest.TestCase):
+    """R14-B: what the WM_NORMAL_HINTS seam DECLARES.  The X property I/O
+    itself is scripts/smoke_aspecthints.py (live server read-back); this
+    pins the DECISION at every state edge, using the real methods and the
+    fake's recording seam ((16,9)-style pair = publish, None = clear)."""
+
+    def tearDown(self):
+        win = getattr(self, "win", None)
+        if win is not None:
+            ReelseeWindow._aspect_forget(win)
+        if getattr(win, "_aspect_hints_id", None):
+            GLib.source_remove(win._aspect_hints_id)
+
+    def test_publishes_the_video_pair(self):
+        self.win = win = _AspectWin(_cfg(), WIDE_SNAP)
+        win._aspect_hints_apply()
+        self.assertEqual(win.hints, [(16, 9)])
+
+    def test_vertical_video_publishes_9_16(self):
+        self.win = win = _AspectWin(_cfg(), {"dwidth": 270, "dheight": 480})
+        win._aspect_hints_apply()
+        self.assertEqual(win.hints, [(9, 16)])
+
+    def test_no_video_clears(self):
+        self.win = win = _AspectWin(_cfg(), {})      # idle: nothing to lock
+        win._aspect_hints_apply()
+        self.assertEqual(win.hints, [None])
+
+    def test_unlock_clears_even_with_a_video(self):
+        cfg = _cfg()
+        cfg.set("ui.lock_aspect", False)
+        self.win = win = _AspectWin(cfg, WIDE_SNAP)
+        win._aspect_hints_apply()
+        self.assertEqual(win.hints, [None])
+
+    def test_lock_action_edges_toggle_the_declaration(self):
+        from window import make_aspect_lock_action
+        import gi
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Gio
+        cfg = _cfg()
+        self.win = win = _AspectWin(cfg, WIDE_SNAP, size=(1000, 563))
+        act = make_aspect_lock_action(True)
+        win._aspect_lock_action = act
+        act.connect("change-state", win._act_aspect_lock)
+        grp = Gio.SimpleActionGroup()
+        grp.add_action(act)
+        grp.activate_action("toggle-aspect-lock", None)     # OFF
+        self.assertEqual(win.hints, [None])
+        grp.activate_action("toggle-aspect-lock", None)     # back ON
+        self.assertEqual(win.hints, [None, (16, 9)])
+
+    def test_settings_row_edge_declares_too(self):
+        cfg = _cfg()
+        self.win = win = _AspectWin(cfg, WIDE_SNAP, size=(1000, 563))
+        cfg.set("ui.lock_aspect", False)
+        win.on_setting_changed("ui.lock_aspect", False)
+        self.assertEqual(win.hints, [None])
+        cfg.set("ui.lock_aspect", True)
+        win.on_setting_changed("ui.lock_aspect", True)
+        self.assertEqual(win.hints, [None, (16, 9)])
+
+    def test_genuine_size_change_schedules_a_republish(self):
+        # GDK can rewrite WM_NORMAL_HINTS mid-resize — the size-change arm
+        # is the watchdog; a repaint (same size) must never schedule.
+        self.win = win = _AspectWin(_cfg(), WIDE_SNAP, size=(1000, 563))
+        win._on_surface_layout(None, 1000, 563)     # same box: silent
+        self.assertEqual(win.hints_soon, 0)
+        win._on_surface_layout(None, 1100, 620)     # a real size change
+        self.assertEqual(win.hints_soon, 1)
+
+    def test_fullscreen_blindness_falls_back_to_the_last_pair(self):
+        # MEASURED (probe on pre-R14 HEAD too): entering fullscreen
+        # re-inits vo; dwidth/dheight blank and are NOT re-emitted while
+        # the file keeps playing.  The fullscreen-leave edge must still
+        # RESTORE the declaration — so the last OBSERVED pair is kept as
+        # a memory for exactly this blind window (never for idle).
+        self.win = win = _AspectWin(_cfg(), WIDE_SNAP)
+        self.assertEqual(win._aspect_hints_pair(), (16, 9))
+        win._aspect_hints_seen = (16, 9)            # as _on_snapshot did
+        win.core.snapshot.update({"dwidth": 0, "dheight": 0})
+        self.assertEqual(win._aspect_hints_pair(), (16, 9))
+        win._aspect_hints_apply()
+        self.assertEqual(win.hints, [(16, 9)])      # restore edge works
+
+    def test_idle_forgets_the_fallback_memory(self):
+        # the fallback is for a TRANSIENT vo blind spot, not for "no
+        # video": once the core reports idle the memory is dropped and
+        # the hints go off.
+        self.win = win = _AspectWin(_cfg(), WIDE_SNAP)
+        win._aspect_hints_seen = (16, 9)
+        win.core.snapshot = {"dwidth": 0, "dheight": 0,
+                             "idle-active": True}
+        self.assertIsNone(win._aspect_hints_pair())
+        self.assertIsNone(win._aspect_hints_seen)
 
 
 if __name__ == "__main__":

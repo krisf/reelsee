@@ -257,7 +257,8 @@ class WindowCapture(unittest.TestCase):
             _closing=False,
             core=SimpleNamespace(snapshot={"dwidth": 1080, "dheight": 1920}),
             _aspect_file_id=None, _aspect_applied=None,
-            _geom_adopted=True)
+            _geom_adopted=True,
+            _aspect_hints_apply=lambda: None)   # R14-B seam: X I/O, gated live
         stub._geom_consume = lambda: ReelseeWindow._geom_consume(stub)
         self.assertFalse(ReelseeWindow._aspect_on_file(stub))
         self.assertIsNone(stub._aspect_file_id)     # polling stopped

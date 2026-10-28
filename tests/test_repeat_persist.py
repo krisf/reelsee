@@ -26,6 +26,8 @@ import tempfile
 import unittest
 
 import config
+import vidsup
+from window import ReelseeWindow
 
 
 class _Core:
@@ -66,6 +68,11 @@ class _Win:
     """bare object carrying exactly the attributes the repeat writers
     touch — the REAL methods run unbound."""
 
+    # R16-B: `_push_all_settings` routes the audio-only switch through the
+    # ONE `vid` writer, which needs the suppression state machine.
+    _apply_vid = ReelseeWindow._apply_vid
+    _vid_write = ReelseeWindow._vid_write
+
     def __init__(self, cfg, core, rep_mode="off"):
         self.cfg = cfg
         self.core = core
@@ -73,6 +80,8 @@ class _Win:
         self._rep_mode = rep_mode
         self._transient_muted = False    # _push_all_settings reads it
         self._ctx_repeat = _Action()
+        self._vidsup = vidsup.VidSuppression(
+            bool(cfg.get("playback.suppress_video_when_hidden", True)))
         self.set_calls = []
         real = cfg.set
 
@@ -186,13 +195,14 @@ class TestLoadReapplies(_TmpCfgCase):
         self.assertIn(("loop-file", "no"), core.props)
         self.assertIn(("loop-playlist", "inf"), core.props)
 
-    def test_defaults_push_no_no(self):
-        # documents the (now harmless) clobber source: the push mirrors
-        # CONFIG, so with defaults it pushes no/no — with the persisted
-        # mode it pushes the mode (tests above).
+    def test_defaults_push_inf_no(self):
+        # documents the push source: the push mirrors CONFIG, so with
+        # defaults it mirrors the DEFAULTS — which since R15-B are
+        # inf/no (repeat ships ON).  With a persisted mode it pushes
+        # the mode (tests above) — the R9 contract is unchanged.
         core = _Core()
         self.push(_Win(self.cfg, core))
-        self.assertIn(("loop-file", "no"), core.props)
+        self.assertIn(("loop-file", "inf"), core.props)
         self.assertIn(("loop-playlist", "no"), core.props)
 
 
@@ -248,11 +258,19 @@ class TestUnknownValue(_TmpCfgCase):
         self.assertEqual(w._rep_mode, "off")
 
     def test_unknown_value_seed_derives_off(self):
-        # the chrome/radio seeds are this same pure derivation:
+        # the chrome/radio seeds are this same pure derivation.  R15-B
+        # note: the test now STORES the junk value — the fresh default
+        # is no longer "no" but the KNOWN value "inf", which seeds the
+        # new default mode "one" (asserted below, on purpose).
         from chrome import repeat_mode
+        self.cfg.set("playback.loop_file", "banana")
+        self.cfg.set("playback.loop_playlist", "banana")
         seed = repeat_mode(self.cfg.get("playback.loop_file"),
                            self.cfg.get("playback.loop_playlist"))
         self.assertEqual(seed, "off")
+        fresh = repeat_mode(config.DEFAULTS["playback"]["loop_file"],
+                            config.DEFAULTS["playback"]["loop_playlist"])
+        self.assertEqual(fresh, "one")     # R15-B: defaults seed repeat ON
 
 
 class TestKeyHoleClosed(_TmpCfgCase):

@@ -1,7 +1,10 @@
 #!/usr/bin/python3
 """R9 gate smoke: the repeat choice PERSISTS (three real processes).
 
-Phase 1 (process A, fresh config): repeat OFF at start; the NATIVE "r"
+Phase 1 (process A, fresh config): R15-B changed the fresh-install
+default (repeat ships ON), so the phase now begins by proving the
+fresh boot is born REPEAT ONE and clicking once (one -> off) to
+re-establish the OFF baseline; the NATIVE "r"
 and "l" keys (real XTEST presses, focus-then-fake-input exactly like the
 r6mute gate) walk the mode off -> all -> one — the mpv properties AND
 the icon AND the context radio AND the config disk follow every press,
@@ -214,7 +217,8 @@ def base_schedule(app, phase):
         w._set_repeat_mode = writer
 
     # ------------------------------------------------------------ phase 1
-    # fresh process, fresh config: the NATIVE keys walk the tri-state
+    # fresh process, fresh config: R15-B makes it BORN "one"; one click
+    # restores the OFF baseline, then the NATIVE keys walk the tri-state
     # and every leg must persist on the spot.
     def p1_ready():
         # the snapshot must carry the two loop properties before the
@@ -225,8 +229,25 @@ def base_schedule(app, phase):
                         guard(p1_playing))
 
     def p1_playing():
-        # fresh scratch dir: no config.json on disk yet, so the off
-        # state is asserted for mpv + icon + radio only here
+        # R15-B premise update (documented in its own commit): a fresh
+        # install is now born REPEAT ONE — mpv seeded loop-file=inf, the
+        # radio says "one".  Prove it, then one button click (one -> off)
+        # re-establishes the OFF baseline this phase was built on.
+        return wait_for(
+            "p1_born_one",
+            lambda: loops() == ("inf", "no") and radio() == "one",
+            guard(p1_off_baseline))
+
+    def p1_off_baseline():
+        check("p1_fresh_born_one", True, "R15-B: default is ON now")
+        click()                              # one -> off
+        return again(guard(lambda: wait_for(
+            "p1_off_reached", lambda: loops() == ("no", "no"),
+            guard(p1_playing_off))), 100)
+
+    def p1_playing_off():
+        # OFF baseline restored: assert mpv + icon + radio (no disk
+        # expectation — a fresh scratch dir may hold no config yet)
         expect_mode("off", "no", "no", LOOP, True, want_disk=False)
         state["calls0"] = state["writer_calls"]
         focus_window()

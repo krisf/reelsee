@@ -27,6 +27,7 @@ import config
 import aspect
 import engine
 import settings_ui
+import vidsup
 from gi.repository import Gio, GLib
 from window import ReelseeWindow, make_crop_action
 from _bootstrap import TMP_ROOT  # noqa: F401
@@ -62,6 +63,10 @@ class _CropWin:
     _sync_crop_action = ReelseeWindow._sync_crop_action
     _crop_aspect_effect = ReelseeWindow._crop_aspect_effect
     _push_all_settings = ReelseeWindow._push_all_settings
+    # R16-B: `_push_all_settings` routes the audio-only switch through the
+    # ONE `vid` writer, which needs the suppression state machine.
+    _apply_vid = ReelseeWindow._apply_vid
+    _vid_write = ReelseeWindow._vid_write
     _aspect_locked = ReelseeWindow._aspect_locked
     _sync_aspect_action = ReelseeWindow._sync_aspect_action
     on_setting_changed = ReelseeWindow.on_setting_changed
@@ -74,7 +79,11 @@ class _CropWin:
         self._transient_muted = False
         self._fs = False
         self._aspect_lock_action = None
+        self._aspect_hints_seen = None      # R14-B fallback memory (the
+        # real _aspect_hints_pair reads it; tests never seed it)
         self._crop_on = bool(cfg.get("video.crop_to_window", False))
+        self._vidsup = vidsup.VidSuppression(
+            bool(cfg.get("playback.suppress_video_when_hidden", True)))
         self._crop_action = make_crop_action(self._crop_on)
         self._crop_action.connect("change-state", self._act_crop)
         self._ctx_crop = Gio.SimpleAction.new_stateful(
@@ -86,6 +95,8 @@ class _CropWin:
                 else v.get_boolean()))
         self.realigns = 0
         self.forgets = 0
+        self.hints = []
+        self.hints_soon = 0
 
     def _aspect_realign(self):
         # faithful stand-in: the REAL _aspect_realign early-returns on
@@ -95,6 +106,18 @@ class _CropWin:
 
     def _aspect_forget(self):
         self.forgets += 1
+
+    # R14-B seam, recorded like realign/forget above (live X behaviour is
+    # scripts/smoke_aspecthints.py's job); the pair is the REAL pure math
+    # so a crop flip asserts the same decision production would publish.
+    _aspect_hints_pair = ReelseeWindow._aspect_hints_pair
+
+    def _aspect_hints_apply(self):
+        self.hints.append(self._aspect_hints_pair()
+                          if self._aspect_locked() else None)
+
+    def _aspect_hints_soon(self, *_a):
+        self.hints_soon += 1
 
     def is_fullscreen(self):
         return False
@@ -156,6 +179,19 @@ class TestAspectSuspension(unittest.TestCase):
         self.assertEqual((win.forgets, win.realigns), (0, 0))
         self.assertFalse(any("paused" in t for t in win.chrome.osd))
         self.assertFalse(win._aspect_locked())    # setting off = never on
+
+    def test_crop_flip_declares_and_retracts_the_aspect_hints(self):
+        # R14-B: crop-ON must PULL the WM_NORMAL_HINTS (a WM still
+        # enforcing PAspect would undo the crop on the next drag); crop-OFF
+        # hands them back together with the lock.  The pair is the REAL
+        # paspect_pair over the fake's observed dims.
+        win = _CropWin(_cfg())                    # lock default True
+        win.core.snapshot.update({"dwidth": 1920, "dheight": 1080})
+        self.assertEqual(win._aspect_hints_pair(), (16, 9))
+        win._set_crop(True)
+        self.assertEqual(win.hints, [None])             # cleared, exactly 1
+        win._set_crop(False)
+        self.assertEqual(win.hints, [None, (16, 9)])    # published, exactly 1
 
     def test_setting_flip_while_crop_on_does_not_fight(self):
         # user toggles ui.lock_aspect (settings row) WHILE cropping: the

@@ -18,6 +18,7 @@ import ctypes
 import locale
 import logging
 import threading
+import time
 
 import gi
 
@@ -42,6 +43,12 @@ class RenderView:
         self.rctx: ctypes.c_void_p | None = None
         self.teared_down = False
         self.render_count = 0
+        # R16-A: real-time stamp of the LAST MPV_RENDER_UPDATE_FRAME this
+        # pump drained — the cadence ladder's only evidence that a video
+        # track is producing pictures (frame_age_ms).  Written on the main
+        # thread only; the mpv update callback still sets a flag and
+        # NOTHING else (§0.3).
+        self._last_frame_wall: float | None = None
         self.update_flag = threading.Event()
         self._egl = ctypes.CDLL("libEGL.so.1")
         self._egl.eglGetProcAddress.restype = ctypes.c_void_p
@@ -150,10 +157,26 @@ class RenderView:
 
     # ------------------------------------------------------------- main poll
     def poll(self) -> None:
-        """10 ms main-thread pump (§0.3): update callback only set a flag."""
+        """Main-thread pump (§0.3): the update callback only set a flag.
+
+        R16-A: this pump runs on the ADAPTIVE cadence (src/cadence.py) —
+        10 ms while frames are arriving, 100 ms while nothing is — and it is
+        never suspended while the window lives, so video and the mpv event
+        queue are always drained.  The frame flag read here is what tells
+        the driver "pictures are moving" (frame_age_ms).
+        """
         if self.rctx is None or not self.update_flag.is_set():
             return
         self.update_flag.clear()
         flags = self.lib.mpv_render_context_update(self.rctx)
         if flags & M.MPV_RENDER_UPDATE_FRAME and not self.teared_down:
+            self._last_frame_wall = time.monotonic()
             self.area.queue_render()
+
+    def frame_age_ms(self) -> float | None:
+        """Real-time ms since the last frame flag was drained here (None =
+        never one).  A paused / video-off / media-less track ages out; a
+        playing one keeps it near 0, which is exactly the ladder's test."""
+        if self._last_frame_wall is None:
+            return None
+        return (time.monotonic() - self._last_frame_wall) * 1000.0

@@ -19,11 +19,14 @@ class Clock:
 
 
 def sample(clock_t, *, vf=30.0, cfps=30.0, drop=0, dec=0, hwdec="vaapi",
-           playing=True, pause=False, seeking=False, idle=False, eof=False):
+           playing=True, pause=False, seeking=False, idle=False, eof=False,
+           paused_for_cache=False, cbs=None):
+    """`cbs` = observed cache-buffering-state (None = never observed)."""
     return WD.Sample(t=clock_t, playing=playing, pause=pause,
                      seeking=seeking, idle=idle, eof=eof, vf_fps=vf,
                      container_fps=cfps, drop=drop, dec_drop=dec,
-                     hwdec=hwdec)
+                     hwdec=hwdec, paused_for_cache=paused_for_cache,
+                     cache_buffering_state=cbs)
 
 
 class Base(unittest.TestCase):
@@ -391,6 +394,202 @@ class R2Engagement(unittest.TestCase):
             data = json.load(open(path))
             self.assertEqual(data["last_fallback"]["to"], "vaapi-copy")
             self.assertIn("0000:13:00.0|vaapi-copy|h264", data)  # merge
+
+
+class R17Buffering(unittest.TestCase):
+    """R17-D truth table (ROUND17-BRIEF §D.3), driven by synthetic observed
+    property feeds — mpv is never involved.  The rule under test: a sample
+    in which the stream is buffering (`paused-for-cache` true OR
+    `cache-buffering-state` < 100) is NOT COUNTED — the consecutive-overload
+    streak neither increments nor resets across it, and the GPU-engagement
+    deadline does not tick down."""
+
+    def setUp(self):
+        self.clock = Clock()
+        self.wd = WD.Watchdog(clock=self.clock)
+        self.wd.file_loaded()
+        self.clock.advance(5.0)                   # past the startup grace
+
+    def _watcher(self, mode="vaapi"):
+        chain = WD.FallbackChain(mode)
+        applied, acts = [], []
+        w = WD.EngagementWatcher(chain, applied.append, acts.append,
+                                 clock=self.clock)
+        return w, applied, acts
+
+    def _clean(self, **kw):
+        return self.wd.feed(sample(self.clock.t, vf=30.0, **kw))
+
+    def test_a_ten_buffering_samples_never_demote(self):
+        """(a) 10 consecutive buffering samples with fps=0 and rising drop
+        counters → no demotion, and the engagement deadline stays frozen."""
+        self.assertIsNone(self._clean())          # clean baseline sample
+        drop = 0
+        for i in range(10):
+            self.clock.advance(1.0)
+            drop += 30                            # 30 frames dropped / second
+            act = self.wd.feed(sample(self.clock.t, vf=0.0, drop=drop,
+                                      paused_for_cache=True, cbs=40))
+            self.assertIsNone(act, f"buffering sample {i} demoted")
+        self.assertEqual(self.wd._streak, 0, "streak grew during buffering")
+        self.assertIsNone(self.wd.last_action)
+        # the same 10 s on the engagement watcher: nothing applied, and the
+        # deadline is exactly WATCH_S away — it did not tick down at all.
+        w, applied, acts = self._watcher()
+        w.arm(now=self.clock.t)
+        for _ in range(10):
+            self.clock.advance(1.0)
+            self.assertIsNone(w.feed("no", now=self.clock.t, buffering=True))
+        self.assertEqual(applied, [])
+        self.assertEqual(acts, [])
+        self.assertAlmostEqual(w._deadline,
+                               self.clock.t + WD.EngagementWatcher.WATCH_S)
+        # ... and the frozen time is not lost: the timeout still fires once
+        # buffering ends and WATCH_S of NON-buffering time elapses.
+        self.clock.advance(2.9)
+        self.assertIsNone(w.feed("no", now=self.clock.t))
+        self.clock.advance(0.2)
+        self.assertEqual(w.feed("no", now=self.clock.t)["kind"], "fallback")
+
+    def test_b_healthy_buffering_healthy_no_demotion(self):
+        """(b) healthy → buffering → healthy → no demotion (a clean sample
+        after the gap resets the streak as it always did)."""
+        self.assertIsNone(self._clean())
+        for _ in range(2):                        # streak 2, no action yet
+            self.clock.advance(1.0)
+            self.assertIsNone(self.wd.feed(sample(self.clock.t, vf=10.0)))
+        self.assertEqual(self.wd._streak, 2)
+        self.clock.advance(1.0)                   # buffering: frozen
+        self.assertIsNone(self.wd.feed(sample(self.clock.t, vf=0.0,
+                                              paused_for_cache=True, cbs=10)))
+        self.assertEqual(self.wd._streak, 2)
+        self.clock.advance(1.0)                   # healthy again: reset
+        self.assertIsNone(self.wd.feed(sample(self.clock.t, vf=30.0)))
+        self.assertEqual(self.wd._streak, 0)
+        for _ in range(2):                        # two more: still short
+            self.clock.advance(1.0)
+            self.assertIsNone(self.wd.feed(sample(self.clock.t, vf=10.0)))
+        self.assertEqual(self.wd._streak, 2)
+        self.assertIsNone(self.wd.last_action)
+
+    def test_c_overload_across_buffering_gap_still_demotes(self):
+        """(c) overload, a buffering gap in the middle, overload resumes →
+        demotion still fires: the streak is CONSECUTIVE ACROSS the frozen
+        gap (the fine line the brief draws)."""
+        self.assertIsNone(self._clean())
+        self.clock.advance(1.0)
+        self.assertIsNone(self.wd.feed(sample(self.clock.t, vf=10.0)))
+        for _ in range(2):                        # gap: neither counts nor resets
+            self.clock.advance(1.0)
+            self.assertIsNone(self.wd.feed(sample(self.clock.t, vf=0.0,
+                                                  paused_for_cache=True,
+                                                  cbs=50)))
+        self.assertEqual(self.wd._streak, 1)
+        self.clock.advance(1.0)
+        self.assertIsNone(self.wd.feed(sample(self.clock.t, vf=10.0)))
+        self.clock.advance(1.0)
+        act = self.wd.feed(sample(self.clock.t, vf=10.0))
+        self.assertIsNotNone(act, "overload across a buffering gap must demote")
+        self.assertEqual(act["kind"], "demote")
+        self.assertEqual((act["from"], act["to"]), ("vaapi", "vaapi-copy"))
+
+    def test_d_full_cache_overload_still_demotes(self):
+        """(d) the positive control: 3 consecutive overloaded samples with a
+        FULL cache (cache-buffering-state 100, not paused-for-cache) demote
+        exactly as before — the freeze must not swallow real overload."""
+        self.assertIsNone(self._clean(cbs=100))
+        acts = []
+        for _ in range(3):
+            self.clock.advance(1.0)
+            acts.append(self.wd.feed(sample(self.clock.t, vf=10.0, cbs=100)))
+        self.assertIsNone(acts[0])
+        self.assertIsNone(acts[1])
+        self.assertEqual(acts[2]["kind"], "demote")
+        self.assertEqual(self.wd._streak, 0)      # consumed by the action
+
+    def test_e_cpu_hwdec_buffering_changes_nothing(self):
+        """(e) buffering observed but hwdec-current is already CPU: nothing
+        changes — no demote, no toast, streak untouched; and when buffering
+        ends the pre-existing terminal CPU path still behaves as before."""
+        self.assertIsNone(self.wd.feed(sample(self.clock.t, vf=30.0,
+                                              hwdec="no")))
+        for _ in range(6):
+            self.clock.advance(1.0)
+            self.assertIsNone(self.wd.feed(sample(
+                self.clock.t, vf=10.0, drop=30, hwdec="no",
+                paused_for_cache=True, cbs=20)))
+        self.assertEqual(self.wd._streak, 0)
+        self.assertIsNone(self.wd.last_action)
+        # buffering over: the legacy terminal-toast path is untouched
+        acts = []
+        for _ in range(3):
+            self.clock.advance(1.0)
+            acts.append(self.wd.feed(sample(self.clock.t, vf=10.0, drop=30,
+                                            hwdec="no", cbs=100)))
+        self.assertEqual(acts[2]["kind"], "toast")
+
+    def test_is_buffering_matrix(self):
+        """The classifier itself, including the two edges that must not
+        freeze the watchdog forever: a never-observed percentage is NOT
+        buffering, and 100 (ready) is NOT buffering."""
+        self.assertTrue(WD.is_buffering(True, None))
+        self.assertTrue(WD.is_buffering(True, 100))
+        self.assertTrue(WD.is_buffering(False, 99))
+        self.assertTrue(WD.is_buffering(False, 0))
+        self.assertTrue(WD.is_buffering(False, "42"))     # mpv gives ints
+        self.assertFalse(WD.is_buffering(False, None))    # not observed yet
+        self.assertFalse(WD.is_buffering(False, 100))     # cache ready
+        self.assertFalse(WD.is_buffering(False, 1000))    # over-filled
+        self.assertTrue(WD.is_buffering(False, 0.0))      # 0 % filled = filling
+        self.assertFalse(WD.is_buffering(None, None))
+        self.assertFalse(WD.is_buffering(False, "nonsense"))
+
+    def test_sample_reports_its_own_buffering_state(self):
+        self.assertTrue(sample(0.0, paused_for_cache=True).buffering())
+        self.assertTrue(sample(0.0, cbs=10).buffering())
+        self.assertFalse(sample(0.0, cbs=100).buffering())
+        self.assertFalse(sample(0.0).buffering())
+
+    def test_sampler_reads_the_observed_properties(self):
+        """R17-D plumbing: the sampler takes buffering state from the
+        SNAPSHOT only (never a synchronous getter — repo rule)."""
+        class Core:
+            snapshot = {"time-pos": 1.0, "duration": 10.0, "pause": False,
+                        "idle-active": False, "eof-reached": False,
+                        "seeking": False, "estimated-vf-fps": 30.0,
+                        "container-fps": 30.0, "frame-drop-count": 0,
+                        "decoder-frame-drop-count": 0,
+                        "hwdec-current": "vaapi", "paused-for-cache": True,
+                        "cache-buffering-state": 33}
+
+        s = WD.Sampler(Core()).sample()
+        self.assertTrue(s.paused_for_cache)
+        self.assertEqual(s.cache_buffering_state, 33)
+        self.assertTrue(s.buffering())
+        Core.snapshot = dict(Core.snapshot, **{"paused-for-cache": False,
+                                               "cache-buffering-state": 100})
+        self.assertFalse(WD.Sampler(Core()).sample().buffering())
+        Core.snapshot = dict(Core.snapshot, **{"cache-buffering-state": None})
+        self.assertFalse(WD.Sampler(Core()).sample().buffering())
+
+    def test_engagement_freeze_survives_a_fallback_step(self):
+        """The deadline is re-armed after each ladder step, so the freeze
+        has to hold for the re-armed deadline too."""
+        w, applied, _acts = self._watcher("vaapi")
+        w.arm(now=0.0)
+        self.clock.advance(3.1)
+        self.assertEqual(w.feed("no", now=self.clock.t)["kind"], "fallback")
+        self.assertEqual(applied, ["vaapi-copy"])         # deadline re-armed
+        for _ in range(5):                                # 5 s of buffering
+            self.clock.advance(1.0)
+            self.assertIsNone(w.feed("no", now=self.clock.t, buffering=True))
+        self.assertEqual(applied, ["vaapi-copy"])         # no second step
+        self.assertAlmostEqual(w._deadline,
+                               self.clock.t + WD.EngagementWatcher.WATCH_S)
+        self.clock.advance(3.1)
+        # last ladder step → kind is "exhausted" (R2-P2 ladder semantics)
+        self.assertEqual(w.feed("no", now=self.clock.t)["kind"], "exhausted")
+        self.assertEqual(applied, ["vaapi-copy", "no"])
 
 
 if __name__ == "__main__":

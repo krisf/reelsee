@@ -28,6 +28,13 @@ OBSERVED_BASE: dict[str, int] = {
     "eof-reached": M.MPV_FORMAT_FLAG,
     "seeking": M.MPV_FORMAT_FLAG,
     "paused-for-cache": M.MPV_FORMAT_FLAG,
+    # R17-D: the OTHER half of "mpv is still filling its cache".  mpv sets
+    # cache-buffering-state to the PERCENTAGE of the initial cache fill
+    # (100 = ready); it is emitted on change, so it arrives through this
+    # observation and never needs a synchronous getter from the GTK thread
+    # (R9).  A file can be mid-buffering with paused-for-cache momentarily
+    # false (mpv resumes and re-pauses), so the watchdog needs both.
+    "cache-buffering-state": M.MPV_FORMAT_INT64,
     "volume": M.MPV_FORMAT_DOUBLE,
     "mute": M.MPV_FORMAT_FLAG,
     "speed": M.MPV_FORMAT_DOUBLE,
@@ -68,6 +75,9 @@ class MpvCore:
         self._pending_post = False   # data drained but throttled: re-post
         self._stop = threading.Event()
         self.alive = False
+        #: R16-B: optional callable(mode) run at the end of apply_hwdec so a
+        #: window can re-assert state its own vid write would otherwise clobber.
+        self.hwdec_hook = None
 
         locale.setlocale(locale.LC_NUMERIC, "C")  # §0.1 at the creation site
         h = M.ctypes.c_void_p(lib.mpv_create())
@@ -115,10 +125,20 @@ class MpvCore:
 
     def apply_hwdec(self, mode: str) -> None:
         """Runtime decoder switch — the PROVEN mechanism (§0.7): set hwdec
-        ALONE does not re-init; vid must be toggled."""
+        ALONE does not re-init; vid must be toggled.
+
+        `hwdec_hook` (set by the window, R16-B) runs AFTER the sequence:
+        this mechanism's own vid-toggle unconditionally re-enables video,
+        which must not silently undo a suppression the window still owns
+        (a hidden window whose decoder is being switched stays off)."""
         self.command("set", "hwdec", mode)
         self.command("set", "vid", "no")
         self.command("set", "vid", "auto")
+        if self.hwdec_hook is not None:
+            try:
+                self.hwdec_hook(mode)
+            except Exception:                       # noqa: BLE001
+                log.exception("hwdec_hook failed for mode=%s", mode)
 
     # ------------------------------------------------------ main-thread poll
     def add_listener(self, fn) -> None:

@@ -401,7 +401,8 @@ class Chrome:
     SPEED_PRESETS = (1.0, 1.25, 1.5, 2.0, 0.5, 0.75)
 
     def __init__(self, window, cfg, on_seek=None, on_volume=None,
-                 on_speed=None, on_ab=None, on_repeat=None, on_decode=None):
+                 on_speed=None, on_ab=None, on_repeat=None, on_decode=None,
+                 on_activity=None):
         self.win = window
         self.cfg = cfg
         self.on_seek = on_seek
@@ -410,6 +411,13 @@ class Chrome:
         self.on_ab = on_ab
         self.on_repeat = on_repeat
         self.on_decode = on_decode
+        # R16-A: the window's tick driver.  Called at the TOP of every input
+        # path (motion, click, leave, key, menu open/close, OSD/toast, the
+        # observed play/pause edge) — before any visual work — so the fast
+        # cadence is re-armed by the INPUT itself and a SUSPENDED chrome
+        # source (hidden + idle) cannot stay asleep.  None = no driver
+        # (unit tests, the pure machine).
+        self.on_activity = on_activity
         # R9-A: the first paint shows the PERSISTED mode (icon AND dim —
         # _update_repeat reads this seed), so a restart never flickers
         # through "off".  Not a parallel truth: it is this widget's own
@@ -594,33 +602,52 @@ class Chrome:
         return (self.preview, self.osd, self.toast, self.bottom)
 
     # ---------------------------------------------------------------- motion
+    def _activity(self) -> None:
+        """R16-A: tell the window's tick driver that something just happened.
+
+        Called FIRST in every input path - before the state machine is
+        touched and long before any widget is repainted - because the driver
+        may be SUSPENDED: an input has to wake the fast cadence itself, not
+        wait for a slow tick to notice the wake-up.
+        """
+        fn = self.on_activity
+        if fn is not None:
+            fn()
+
     def motion(self, x: float, y: float, width: float, height: float) -> None:
+        self._activity()
         now = self.state.clock()
         self.state.on_pointer_motion(now)
         self.state.set_bottom_hover(height - y <= BOTTOM_HOVER_PX, now)
 
     def click(self) -> None:
+        self._activity()
         self.state.on_pointer_click(self.state.clock())
 
     def leave(self) -> None:
+        self._activity()
         self.state.on_pointer_leave(self.state.clock())
 
     def key(self) -> None:
+        self._activity()
         self.state.on_key(self.state.clock())
 
     def wake(self) -> None:
         """Re-arm the countdown fresh and reveal (state edges such as
         entering/leaving fullscreen use this — same decision path as motion)."""
+        self._activity()
         self.state.on_pointer_motion(self.state.clock())
 
     # ------------------------------------------------------------ R5-A menus
     def menu_opened(self) -> None:
         """A popover opened: hold the chrome revealed (stranding a menu by
         retracting its anchor bar is worse than a late hide) and re-arm."""
+        self._activity()
         self._menu_open += 1
         self.state.on_pointer_motion(self.state.clock())
 
     def menu_closed(self) -> None:
+        self._activity()
         self._menu_open = max(0, self._menu_open - 1)
         if self._menu_open == 0:
             # re-arm the idle timer on close (R5-A): the countdown restarts
@@ -634,6 +661,39 @@ class Chrome:
     def bars_visible(self) -> bool:
         """Current applied chrome visibility (bottom bar + reveal mirror)."""
         return self._bars_visible
+
+    @property
+    def fading(self) -> bool:
+        """R16-A: a reveal crossfade is in flight (the fast cadence must
+        keep running until it lands — the ladder asks, never inspects
+        ``_fade_ids`` from outside)."""
+        return bool(self._fade_ids)
+
+    @property
+    def transient_pending(self) -> bool:
+        """R16-A: an OSD/toast is on screen with an auto-hide deadline that
+        only ``tick()`` retires.  Suspending the tick with one pending would
+        strand a visible overlay forever.
+
+        "Pending" means the deadline is still ARMED, not that it is still in
+        the future.  The instant it passes is the instant a tick is needed to
+        hide the widget, and a test written as ``now < deadline`` reports
+        False at exactly that moment — so the ladder suspends the chrome
+        source with the overlay still visible and nothing left to hide it.
+        The race is not hypothetical: ``TickDriver._pump_cb`` calls ``_apply()``
+        without a ``tick_reveal()``, so a pump dispatch that lands after the
+        deadline expires but before the next chrome tick removes the chrome
+        source for good (measured: the "Crop to window: on" OSD stayed visible
+        for the rest of the session until pointer activity re-armed the
+        driver; scripts/smoke_cropwin.py failed 4 of its 8 settle phases).
+        ``tick()`` zeroes the deadline when it fires, so this cannot stay
+        armed once the overlay is gone."""
+        return self._osd_deadline > 0.0 or self._toast_deadline > 0.0
+
+    @property
+    def animating(self) -> bool:
+        """R16-A: 'something on screen still needs a tick'."""
+        return self.fading or self.transient_pending
 
     # ------------------------------------------------------------ visibility
     def add_reveal_widget(self, widget) -> None:
@@ -776,6 +836,7 @@ class Chrome:
 
     # ------------------------------------------------------------------ OSD
     def show_osd(self, text: str) -> None:
+        self._activity()      # R16-A: a visible OSD needs ticks to retire it
         self.osd.set_label(text)
         self.osd.set_visible(True)
         self._osd_deadline = self.state.clock() + self.osd_ms
@@ -796,6 +857,7 @@ class Chrome:
                 btn.remove_css_class("reelsee-ab-on")
 
     def show_toast(self, text: str, ms: float = 4000.0) -> None:
+        self._activity()      # R16-A: same reason as show_osd
         self.toast.set_label(text)
         self.toast.set_visible(True)
         self._toast_deadline = self.state.clock() + ms
@@ -894,6 +956,10 @@ class Chrome:
         self._paint_decode(decode_state(_obs, *self._decode_flags), _obs)
         if self._last_playing is not playing:
             self._last_playing = playing
+            # R16-A: the observed play/pause edge is a STATE change (it can
+            # show the chrome again — "not-playing"), so it re-arms the fast
+            # cadence from the edge itself, not from a slow tick.
+            self._activity()
             self.state.on_playing_changed(playing)
         dur = snap.get("duration")
         pos = snap.get("time-pos")

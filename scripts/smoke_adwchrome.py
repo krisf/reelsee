@@ -32,6 +32,22 @@ CFG.mkdir(parents=True, exist_ok=True)
 (CFG / "config.json").write_text(json.dumps(
     {"ui": {"chrome_timeout_ms": 400, "osd_ms": 1200}}))
 os.environ["REELSEE_CONFIG_DIR"] = str(CFG)
+# R14 fix (AGENTS.md "remembered window geometry is SHARED state"):
+# this gate crops FIXED SCREEN coordinates (TOP_STRIP/VIDEO_MID), so it
+# only measures what it thinks it measures when the window opens at its
+# default rect.  Until now it inherited the DEFAULT state dir — one
+# stray window.json written by any other run (mine came from a probe)
+# restored a foreign rect, the strip crops fell off the window, and the
+# pixel checks plus the popover-focus checks failed identically on
+# pre-R14 HEAD.  Own state dir, purged, like every other smoke.
+STATE = SCRATCH / "adwchrome-state"
+STATE.mkdir(parents=True, exist_ok=True)
+for _f in ("window.json", "resume.json", "ab.json"):
+    try:
+        (STATE / _f).unlink()
+    except FileNotFoundError:
+        pass
+os.environ["REELSEE_STATE_DIR"] = str(STATE)
 
 import reelsee  # noqa: E402  (after env, like the real entry)
 

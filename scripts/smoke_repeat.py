@@ -123,8 +123,19 @@ def main() -> int:
             return again(s1, 100)
 
         def s1():
-            expect("initial_off", "off", ("no", "no"),
-                   "media-playlist-repeat-symbolic", True)
+            # R15-B premise update (own commit): a FRESH install is born
+            # REPEAT ONE now (loop_file default "inf"), not off.  Assert
+            # the new birth state and click once (one -> off) to restore
+            # the OFF baseline this click-cycle walk was built on; the
+            # rest of the cycle (off -> all -> one -> off) is unchanged.
+            expect("initial_one", "one", ("inf", "no"),
+                   "media-playlist-repeat-song-symbolic", False)
+            btn().emit("clicked")                     # one -> off
+            return again(lambda: wait_for(
+                "mpv_off_props", lambda: loops() == ("no", "no"),
+                guard(s1b), left=25), 80)
+
+        def s1b():
             # this binding exposes no a11y label GETTER — verify the
             # update_property([LABEL], ["Repeat: <mode>"]) call instead
             state["a11y_calls"] = []

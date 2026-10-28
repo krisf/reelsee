@@ -8,6 +8,7 @@ closes; mpv_terminate_destroy happens later on a worker.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 import time
@@ -16,6 +17,7 @@ import gi
 
 import ab as AB
 import aspect
+import cadence
 import chrome
 import config as C
 import ctxmenu
@@ -23,6 +25,8 @@ import engine
 import keymap
 import mpvlib as M
 import reelsee_io
+import tickdrive
+import vidsup
 import watchdog as WD
 import wingeom
 import x11pos
@@ -35,6 +39,202 @@ gi.require_version("Pango", "1.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
 log = logging.getLogger("reelsee.window")
+
+
+# ---------------------------------------------------------------- R14-A menu
+# GTK's own CSD titlebar gesture path ends at
+# `Gdk.Toplevel.show_window_menu` (on X11 it sends _GTK_SHOW_WINDOW_MENU and
+# mutter pops the WM window menu — the R14 defect).  The real fix is
+# structural (R14-A: the stub titlebar cannot be a target, and the window
+# itself claims button-3 during CAPTURE, so no code path reaches GTK's
+# menu).  As belt-and-braces the call itself is refused at this seam: once
+# this module is imported, a Python-level call to show_window_menu is a
+# logged no-op returning False.  (A C-internal call from inside GTK would
+# bypass a Python patch — which is exactly why the structural claim, not
+# this refusal, is what kills the menu; see DSH-REPORT-R14.)
+_SHOW_MENU_REFUSED_LOGGED = False
+
+
+def _refused_show_window_menu(self, *_a, **_k) -> bool:
+    global _SHOW_MENU_REFUSED_LOGGED
+    if not _SHOW_MENU_REFUSED_LOGGED:
+        _SHOW_MENU_REFUSED_LOGGED = True
+        log.debug("R14-A: refused Gdk.Toplevel.show_window_menu "
+                  "(ours is the only right-click menu)")
+    return False
+
+
+if not getattr(Gdk.Toplevel, "_reelsee_menu_refused", False):
+    Gdk.Toplevel.show_window_menu = _refused_show_window_menu
+    Gdk.Toplevel._reelsee_menu_refused = True
+
+
+# ------------------------------------------------- R17-A C titlebar gestures
+# WHY this block exists (operator-confirmed on the real GNOME/XWayland
+# desktop; reproduced at WIRE level in scratch/r17/probe_wm_menu6.py):
+# `Gtk.WindowHandle` installs its OWN gestures in C at construction — a
+# `Gtk.GestureClick` (button 0 = ANY button, bubble phase) plus a
+# `Gtk.GestureDrag`.  That click gesture implements the three
+# `gtk-titlebar-*-click` settings, and for button 3 its C code calls
+# `gdk_toplevel_show_window_menu()`; on X11 that sends the
+# `_GTK_SHOW_WINDOW_MENU` client message and mutter pops the WM window
+# menu — the R14/R17 defect.  Two consequences, both measured here:
+#
+#   * R14's Python monkeypatch of `Gdk.Toplevel.show_window_menu` can
+#     NEVER run on that path: the C code dispatches through the vfunc
+#     (`GDK_TOPLEVEL_GET_IFACE(toplevel)->show_window_menu`), which never
+#     performs a Python attribute lookup.  R14's own gate spy therefore
+#     counted 0 SPURIOUSLY — and Xvfb has no window manager, so even a
+#     real `_GTK_SHOW_WINDOW_MENU` message vanishes into the void there.
+#   * `gtk-titlebar-right-click` is consulted per click, and GNOME's
+#     xsettings daemon re-pushes `Gtk/TitlebarRightClick` to the client at
+#     any time, so R5-D's startup-only "none" loses on a real desktop.
+#
+# The fix is structural and cannot be routed around: the C gesture is a
+# real `Gtk.GestureClick` visible in `observe_controllers()`, so it can be
+# `remove_controller()`d.  Probe-proven: with a WM advertising
+# `_GTK_SHOW_WINDOW_MENU` in `_NET_SUPPORTED`, right-pressing a plain
+# `Gtk.WindowHandle` puts 1 window-menu client message on the wire while
+# the C click gesture is present and 0 after removing exactly that one
+# controller — the `Gtk.GestureDrag` (drag-anywhere R5-D, header drag
+# R15-A) survives untouched.
+
+#: The three `GtkSettings` keys GTK's C titlebar click gesture consults.
+#: They are ENUM-typed strings ('none' | 'menu' | 'maximize' | 'shade'),
+#: NOT booleans — `False` is not a valid value on this build (probe:
+#: `Gtk.Settings.get_property("gtk-titlebar-right-click")` returns the
+#: STRING 'menu' by default), so 'none' is the value that means "off".
+TITLEBAR_CLICK_SETTINGS = ("gtk-titlebar-double-click",
+                           "gtk-titlebar-middle-click",
+                           "gtk-titlebar-right-click")
+TITLEBAR_CLICK_OFF = "none"
+
+
+def describe_controllers(widget) -> list[str]:
+    """Controller inventory of `widget`, naming the two properties that
+    identify GTK's pre-installed titlebar gestures (button + phase).
+
+    The phase is what tells the app's OWN capture-phase `Gtk.GestureDrag`
+    apart from the `Gtk.GestureDrag` a `Gtk.WindowHandle` pre-installs in
+    C (probe: fresh handle = `GestureDrag(button=1,phase=bubble)` +
+    `GestureClick(button=0,phase=bubble)`), so the gate can assert on the
+    exact set instead of a bare class name."""
+    out = []
+    for c in widget.observe_controllers():
+        name = type(c).__name__
+        if isinstance(c, (Gtk.GestureClick, Gtk.GestureDrag)):
+            name += (f"(button={c.get_button()}"
+                     f",phase={c.get_propagation_phase().value_nick})")
+        out.append(name)
+    return out
+
+
+def strip_handle_click_gestures(widget, what: str) -> dict:
+    """R17-A: remove every `Gtk.GestureClick` GTK pre-installed on a
+    `Gtk.WindowHandle` (the C titlebar click gesture — see the block
+    above), and return an audit dict for the gate to assert on.
+
+    The `Gtk.GestureDrag` is KEPT on purpose: drag-anywhere (R5-D), header
+    drag (R15-A) and "a drag release never reaches the click gesture, so a
+    drag never toggles pause" all depend on it.
+
+    `before`/`after` are the GestureClick counts around the removal; a
+    `before` of 0 means GTK stopped pre-installing the gesture (a GTK
+    change the gate must notice, not silently pass over).
+    """
+    before = [c for c in widget.observe_controllers()
+              if isinstance(c, Gtk.GestureClick)]
+    audit = {"what": what, "before": len(before),
+             "kinds_before": describe_controllers(widget)}
+    for c in before:
+        widget.remove_controller(c)
+    after = [c for c in widget.observe_controllers()
+             if isinstance(c, Gtk.GestureClick)]
+    audit["after"] = len(after)
+    audit["kinds_after"] = describe_controllers(widget)
+    audit["drag_kept"] = any(isinstance(c, Gtk.GestureDrag)
+                             for c in widget.observe_controllers())
+    log.debug("R17-A: %s handle click gestures before=%d after=%d "
+              "(%s -> %s)", what, audit["before"], audit["after"],
+              audit["kinds_before"], audit["kinds_after"])
+    return audit
+
+
+_titlebar_reapplying = False
+#: `notify::` handler ids installed by `harden_titlebar_click_settings()`.
+#: Exposed (not private) so a gate can disconnect them, drive GTK's C
+#: titlebar path with the setting switched back to 'menu', and prove the
+#: STRUCTURAL removal — not the pin — is what keeps `_GTK_SHOW_WINDOW_MENU`
+#: off the wire; the gate then calls `harden_titlebar_click_settings()`
+#: again, which re-pins and re-installs the watches.
+TITLEBAR_PIN_IDS: list[int] = []
+
+
+def _force_titlebar_off(settings, prop: str) -> None:
+    """Write 'none' to one titlebar-click setting unless it already says
+    so; the reentrancy flag stops our own write from re-entering the
+    notify handler."""
+    global _titlebar_reapplying
+    if _titlebar_reapplying:
+        return
+    try:
+        if settings.get_property(prop) == TITLEBAR_CLICK_OFF:
+            return
+        _titlebar_reapplying = True
+        settings.set_property(prop, TITLEBAR_CLICK_OFF)
+    except Exception as exc:                        # noqa: BLE001
+        log.debug("R17-A: could not pin %s: %s", prop, exc)
+    finally:
+        _titlebar_reapplying = False
+
+
+def harden_titlebar_click_settings() -> bool:
+    """Belt-and-braces (the structural removal above is the real fix): pin
+    all three `gtk-titlebar-*-click` settings to 'none' on the default
+    screen, and RE-PIN them on every notify — GNOME's xsettings daemon
+    pushes `Gtk/TitlebarRightClick` back to the client at any time, which
+    is exactly how R5-D's startup-only setting lost on the real desktop.
+    Returns False when there is no Gtk.Settings (no display).  Safe to call
+    more than once: the watches are (re)installed only when none are live,
+    so a gate that disconnected them gets them back."""
+    settings = Gtk.Settings.get_default()
+    if settings is None:
+        return False
+    for prop in TITLEBAR_CLICK_SETTINGS:
+        _force_titlebar_off(settings, prop)
+    if not TITLEBAR_PIN_IDS:
+        for prop in TITLEBAR_CLICK_SETTINGS:
+            try:
+                TITLEBAR_PIN_IDS.append(settings.connect(
+                    f"notify::{prop}",
+                    lambda _s, _p, k=prop: _force_titlebar_off(settings, k)))
+            except Exception as exc:                # noqa: BLE001
+                log.debug("R17-A: no notify watch for %s: %s", prop, exc)
+    return True
+
+
+#: Floor for the drag distance that starts a window move (R17-C).  A click
+#: must never be mistaken for a move: `Gtk.GestureDrag::drag-begin` fires on
+#: the PRESS on this GTK build (measured — see _on_move_drag_begin), so the
+#: move has to wait for real displacement.
+MOVE_DRAG_MIN_PX = 4.0
+
+
+def _drag_threshold_px() -> float:
+    """How far the pointer must travel before an app-owned drag starts a
+    window move: the desktop's own `gtk-dnd-drag-threshold` (8 px on this
+    build), floored at MOVE_DRAG_MIN_PX so a missing or mis-set setting
+    cannot turn every click into a move."""
+    px = 0
+    try:
+        st = Gtk.Settings.get_default()
+        if st is not None:
+            px = int(st.get_property("gtk-dnd-drag-threshold"))
+    except Exception as exc:                        # noqa: BLE001
+        log.debug("R17-C: gtk-dnd-drag-threshold unreadable (%s)", exc)
+    if px <= 0:
+        px = 8
+    return max(MOVE_DRAG_MIN_PX, float(px))
 
 
 def make_aspect_lock_action(on: bool) -> Gio.SimpleAction:
@@ -99,6 +299,11 @@ WINDOW_EXTRA_OBSERVED = {
     # polled: the smokes (and any future display) read it through the
     # snapshot like every other mutable input (R9 discipline).
     "panscan": M.MPV_FORMAT_DOUBLE,
+    # R16-B: the EFFECTIVE video-track state ("auto"/"no"/track id).  The
+    # hidden-video suppression writes `vid` and the gate must assert what
+    # mpv actually holds, not what the app intended to write — so it is
+    # observed like everything else (R9: no sync getter).
+    "vid": M.MPV_FORMAT_STRING,
 }
 
 
@@ -136,6 +341,28 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         self._closing = False
         self._fs = False
         self._transient_muted = False
+        # R16-A: the adaptive tick driver (src/tickdrive.py).  Created with
+        # the sources — everything that can happen before then is a
+        # construction-time no-op for the ladder (see _tick_arm).
+        self._driver: tickdrive.TickDriver | None = None
+        self._tick_pin = cadence.pin_from_env(os.environ)
+        # R16-B: hidden-video suppression.  The POLICY is pure (src/vidsup.py,
+        # unit-tested as a truth table); this side is plumbing: one `vid`
+        # writer plus a `notify::mapped` handler.  `_vid_release` is kept as
+        # the gate-visible trace of what an unmap stopped.
+        self._vidsup = vidsup.VidSuppression(
+            bool(config.get("playback.suppress_video_when_hidden", True)))
+        self._vid_release: str | None = None
+        # R16-C: the thread count already handed to this window (None = never
+        # written, i.e. lavc's own default is still in force).
+        self._lavc_threads: str | None = None
+        # R16-C: last OBSERVED hwdec-current (the edge that recomputes the
+        # budget; None until the first frame decodes).
+        self._hwdec_seen = None
+        # R16-D: focus recency (the app bumps it on every focus-in).  The
+        # decode plan demotes the window that gained focus LAST, so "last"
+        # needs a total order, not a timestamp.
+        self._focus_seq = 0
         # R11: mirror of the persisted crop-to-window truth (the ONE writer
         # _set_crop keeps it, the surfaces and §C's aspect-lock decision
         # read it).  Seeded from config in _build_actions.
@@ -168,6 +395,9 @@ class ReelseeWindow(Gtk.ApplicationWindow):
             n_windows=len(getattr(app, "windows", []) or []) + 1,
             engine_override=engine_override)
         self.core = MpvCore(lib, opts)
+        # R16-B: a decoder switch ends with `set vid auto`; the hook re-states
+        # what vid must be afterwards, so a hidden window stays off.
+        self.core.hwdec_hook = self._reassert_vid
         self.core.observe(WINDOW_EXTRA_OBSERVED)
         self.core.on("file_loaded", self._on_file_loaded)
         self.core.add_listener(self._on_snapshot)
@@ -181,6 +411,12 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         # drag never toggles pause.  During fullscreen the handle is swapped
         # OUT of the tree (below) — a drag there is a structural no-op.
         self._handle = Gtk.WindowHandle()
+        # R17-A: GTK's own C click gesture goes the moment the handle
+        # exists — it is the thing that pops the Mutter window menu on
+        # right-click over the video, and no Python-level patch can stop
+        # it (see the block at the top of this module).
+        self._handle_click_audit = strip_handle_click_gestures(
+            self._handle, "video")
         self._handle.set_child(self.view.area)
         self.overlay.set_child(self._handle)
         self._click_pt: tuple[float, float] | None = None
@@ -208,6 +444,13 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         self.top_bar = self._build_top_chrome()
         self._titlebar_stub = Gtk.Box()
         self._titlebar_stub.add_css_class("reelsee-titlebar-stub")
+        # R14-A: the stub exists ONLY for the CSD machinery — nothing may
+        # ever be a target of it.  GTK's titlebar gestures (drag to move,
+        # double-click to maximise, right-click => show_window_menu) are
+        # driven by events targeting the titlebar subtree; a widget that
+        # cannot be targeted hands them no events, so button-3 over the
+        # top of the window reaches OUR capture controller instead (below).
+        self._titlebar_stub.set_can_target(False)
         self.set_titlebar(self._titlebar_stub)
         # Gtk.Window content slot: the overlay IS the window content —
         # every piece of chrome floats over the video, none reserves px.
@@ -220,18 +463,88 @@ class ReelseeWindow(Gtk.ApplicationWindow):
             on_ab=lambda which: self._ab_hook("set_a" if which == "a"
                                               else "set_b"),
             on_repeat=self._repeat_cycle,
-            on_decode=self._toggle_decode)   # R7-B: the decode toggle
+            on_decode=self._toggle_decode,   # R7-B: the decode toggle
+            on_activity=self._tick_arm)      # R16-A: input re-arms the cadence
         # R12: the top strip is an overlay child too — added FIRST so the
         # z-order matches the old contract (OSD/toast paint over it, the
         # bottom bar stays topmost).
-        self.overlay.add_overlay(self.top_bar)
+        # R15-A: THE HANDLE IS THE OVERLAY CHILD, not the bar.  A
+        # Gtk.WindowHandle carrying the bar makes press-and-drag on any
+        # non-button part of the header a real window move (same
+        # mechanism the video handle has always used); buttons claim
+        # their own press, so their click can never turn into a move.
+        # Aligned START/FILL exactly like the bare strip did — the
+        # handle sizes to its child (valign START), so it never covers
+        # the video below the bar or reserves layout space (R12's
+        # byte-identical allocation invariant is untouched).
+        self._top_handle = Gtk.WindowHandle()
+        # R17-A: same C click gesture, same removal — right-click over the
+        # header must open OUR menu, not mutter's.
+        self._top_handle_click_audit = strip_handle_click_gestures(
+            self._top_handle, "header")
+        self._top_handle.set_valign(Gtk.Align.START)
+        self._top_handle.set_halign(Gtk.Align.FILL)
+        self._top_handle.set_child(self.top_bar)
+        self.overlay.add_overlay(self._top_handle)
         for c in self.chrome.overlay_children():
             # R8-A: every child is added UNCONDITIONALLY — the deleted top
             # menu bar is not returned at all (it exists for NO config).
             self.overlay.add_overlay(c)
         # R12: the top strip fades as ONE group with the bottom bar
         # (opacity + can_target only — see Chrome.set_reveal).
+        # R15-A: BOTH the handle and the bar are in the group — a hidden
+        # header cannot move the window, so the handle's can_target must
+        # follow the chrome decision too (a can_target=True handle over
+        # an invisible bar would be an invisible drag strip).
         self.chrome.add_reveal_widget(self.top_bar)
+        self.chrome.add_reveal_widget(self._top_handle)
+        # ---- R17-A/C: everything the removed C click gesture used to do,
+        # owned by the app instead.  Two pieces:
+        #   * window move: an app-owned drag on each handle that calls
+        #     Gdk.Toplevel.begin_move at the threshold (R17-C — the ONE
+        #     shipped mechanism; see DSH-REPORT-R17);
+        #   * header double-click => maximise/restore (the behaviour the
+        #     removed C gesture carried via gtk-titlebar-double-click).
+        # The video area's own double-click => fullscreen (R6) is NOT
+        # affected by the removal: it lives on the GLArea, so it never
+        # depended on the handle's click gesture.
+        self._move_initiated = 0
+        self._move_drags = {}
+        self._move_pending = {}
+        self._move_threshold = _drag_threshold_px()
+        for _h, _which in ((self._handle, "video"),
+                           (self._top_handle, "header")):
+            _drag = Gtk.GestureDrag()
+            _drag.set_button(1)          # PRIMARY only: a right-drag must
+            # stay a no-op (R6-A: no menu, no move) exactly as before
+            _drag.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            # R17-C: begin_move fires at the THRESHOLD CROSSING, not at
+            # drag-begin.  On this GTK build drag-begin is emitted on the
+            # PRESS itself, so claiming there would swallow every
+            # click-to-pause in the video area (measured: a plain
+            # press+release at the centre started a move and the click
+            # never reached the GLArea's own gesture).  The gate drives
+            # exactly that input, so the bug cannot come back quietly.
+            _drag.connect("drag-begin", self._on_move_drag_begin, _which)
+            _drag.connect("drag-update", self._on_move_drag_update, _which)
+            # GestureDrag has exactly three signals (drag-begin/update/end —
+            # introspected); a cancelled sequence ends with drag-end too, so
+            # one handler covers both.
+            _drag.connect("drag-end", self._on_move_drag_end, _which)
+            _h.add_controller(_drag)
+            self._move_drags[_which] = _drag
+        self._hdr_dblclick = Gtk.GestureClick()
+        self._hdr_dblclick.set_button(1)
+        self._hdr_dblclick.connect("pressed", self._on_header_press)
+        # On the STRIP, not the handle: the handle must end up carrying no
+        # Gtk.GestureClick at all (R17-A's structural assertion), and the
+        # strip fills the handle (halign FILL), so every non-button press in
+        # the header still reaches this gesture.  A press on a window
+        # control button is claimed by the button first — and is excluded by
+        # hit-test anyway, so double-clicking Close closes instead of
+        # maximising.
+        self.top_bar.add_controller(self._hdr_dblclick)
+        self._titlebar_pinned = harden_titlebar_click_settings()
         mc = Gtk.EventControllerMotion()
         mc.connect("motion", lambda _c, x, y: self.chrome.motion(
             x, y, self.overlay.get_width(), self.overlay.get_height()))
@@ -264,6 +577,36 @@ class ReelseeWindow(Gtk.ApplicationWindow):
             self, "_rclick_pt", None))
         self.view.area.add_controller(rclick)
         self._click_gestures = (click, rclick)   # structural introspection
+        # R14-A: button-3 is OWNED by the toplevel.  The area-level
+        # controller above never sees a press whose event-widget is not the
+        # video (top chrome, bottom bar, the stub-titlebar strip, the CSD
+        # edges), and GTK's titlebar path turns exactly those presses into
+        # Gdk.Toplevel.show_window_menu — the WM menu eating our menu.  This
+        # controller runs during CAPTURE at the window — before any
+        # descendant handler can bubble — and opens OUR popover at the
+        # pointer.  Claiming is not reachable from this binding (pointer
+        # sequences marshal as None, gtk_gesture_set_state(None) is
+        # refused) and a descendant CLAIM — GtkRange's internal gesture
+        # claims EVERY button, so the seek bar does — silences our
+        # ``released`` for the rest of the sequence.  The base Gesture
+        # ``end`` signal still fires for a DENIED capture gesture (proved
+        # empirically), so the open is driven from ``end`` and the R6-A
+        # 12 px drift rule measures device-position reads taken at press
+        # and at end — same coordinate space, so the CSD shadow inset
+        # cancels out without ever being named.  Ownership is
+        # order-based: capture arms _rclick_top_pt first and the
+        # area-level fallback (kept for presses this one somehow misses)
+        # disarms itself on sight of the marker.  One popover, never a
+        # double-open.
+        self._rclick_top_pt = None
+        rclick_top = Gtk.GestureClick()
+        rclick_top.set_button(3)
+        rclick_top.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        rclick_top.connect("pressed", self._on_rclick_top_press)
+        rclick_top.connect("end", self._on_rclick_top_end)
+        rclick_top.connect("cancel", self._on_rclick_top_cancel)
+        self.add_controller(rclick_top)
+        self._rclick_top = rclick_top
 
         # ---- R8-B aspect-locked resize ------------------------------------
         # GTK 4 has no geometry hints left, so the window CORRECTS its own
@@ -281,6 +624,14 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         self._aspect_debounce_ms = aspect.DEBOUNCE_MS   # gate-tunable knob
         self._aspect_corrections = 0      # honest counter (smokes read it)
         self._aspect_lock_action = None   # bound in _build_actions
+        # R14-B: WM_NORMAL_HINTS/PAspect publishing.  The debounce is
+        # SEPARATE from the correction debounce on purpose: republishing a
+        # property must never be entangled with resizing the window.
+        self._aspect_hints_id = None      # one-shot republish timer
+        self._aspect_hints_seen = None    # last pair seen; the one
+        #   transient-fullscreen fallback memory (R14-B) — forgotten at
+        #   stop and at every file-load edge
+        self._aspect_hints_wsrc = None    # io watch: defend the property
 
         # ---- R10 remembered geometry / cascade placement ------------------
         # The WHERE-decisions are pure functions in src/wingeom.py (unit
@@ -305,7 +656,20 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         self._build_actions()
         self._build_popovers()          # §7 T1: playlist / chapters / tracks
         self._build_context_menu()      # R6-A: right-click menu on video
-        self._tick_id = GLib.timeout_add(10, self._tick)
+        # R16-A: THE 100 Hz-FOREVER TICK IS GONE.  One fixed 10 ms source
+        # used to drive chrome reveal AND the render/event pump for every
+        # window, visible or not, forever; N windows meant N x 100 Hz of
+        # Python through one GIL.  The work is now TWO sources with an
+        # adaptive ladder (src/cadence.py decides, src/tickdrive.py applies):
+        # the CHROME source runs at 10 ms during fades/activity, 100 ms
+        # while visible+stable and has NO SOURCE AT ALL while the chrome is
+        # hidden; the PUMP source drains mpv frames/events at 10 ms while
+        # pictures are arriving and 100 ms while nothing is — it never
+        # stops, because a stopped pump is a frozen picture and a stalled
+        # playlist.  Both current intervals are introspectable
+        # (tick_interval_ms / pump_interval_ms) and the gates read them.
+        self._driver = tickdrive.TickDriver(self, pin_ms=self._tick_pin)
+        self._driver.start()
         # §7 T1 resume: cheap dict write every 5 s, flushed on window close
         self._resume_id = GLib.timeout_add(5000, self._resume_tick)
         # R10: user drags move the window with NO GTK signal a WM guarantees
@@ -348,9 +712,18 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         # in total silence — so re-wire on the replacement itself, not only
         # on the next map.
         self.connect("notify::surface", self._wire_aspect_surface)
+        # R14-B: a WM that maximizes us (or un-maximizes) changes lock
+        # eligibility without ever meeting an action of ours — republish
+        # the size hints on the property signal, debounced.
+        self.connect("notify::maximized", self._aspect_hints_soon)
+        self.connect("notify::fullscreened", self._aspect_hints_soon)
 
         # R-audio focus policy (§4.10): only the focused window keeps audio
         self.connect("notify::is-active", self._on_active)
+
+        # R16-B: minimize/unmap == stop decoding what nobody can see (and
+        # ONLY that — fullscreen and normal-state changes keep us mapped).
+        self.connect("notify::mapped", self._on_mapped_changed)
 
     # ------------------------------------------------------------- clicks --
     def _on_press(self, _gesture=None, n_press=1, x=0.0, y=0.0, *_a) -> None:
@@ -417,6 +790,17 @@ class ReelseeWindow(Gtk.ApplicationWindow):
 
     # ------------------------------------------------- R6-A context menu --
     def _on_rclick_press(self, _g, n_press, x, y, *_a) -> None:
+        # R14-A: the area-level controller is the FALLBACK.  This GTK
+        # binding exposes no way to CLAIM a sequence from Python (no
+        # set_sequence / get_current_event_sequence in the introspection
+        # data), so ownership is enforced by propagation ORDER instead:
+        # the toplevel CAPTURE-phase handler below runs before this
+        # bubbling one for every button-3 press; when it armed itself for
+        # this press, the marker is set and we stand down — one press can
+        # never open two menus.
+        if self._rclick_top_pt is not None:
+            self._rclick_pt = None
+            return
         self._rclick_pt = (float(x), float(y)) if int(n_press) == 1 else None
 
     def _on_rclick_release(self, _g, n_press, x, y, *_a) -> None:
@@ -426,6 +810,60 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         if abs(float(x) - pt[0]) > 12 or abs(float(y) - pt[1]) > 12:
             return          # a right-button DRAG: no menu, no drag, no-op
         self._open_context_menu(float(x), float(y))
+
+    # ------------------------------------- R14-A toplevel button-3 owner --
+    def _rclick_dev_pt(self):
+        """Pointer in SURFACE coordinates (0,0 = X surface top-left), or
+        None.  Independent of gesture propagation, so it is still exact
+        while a descendant has claimed the button sequence."""
+        surf = self.get_surface()
+        if surf is None:
+            return None
+        try:
+            seat = self.get_display().get_default_seat()
+            res = surf.get_device_position(seat.get_pointer())
+        except Exception:
+            return None
+        # this binding marshals as (grab_ok, x, y, ...):
+        if not isinstance(res, tuple) or len(res) < 3 or not res[0]:
+            return None
+        return float(res[1]), float(res[2])
+
+    def _on_rclick_top_press(self, _gesture, n_press, x, y, *_a) -> None:
+        # CAPTURE phase on the toplevel: this runs for EVERY button-3
+        # press in the window — video, top chrome, bottom bar (incl. the
+        # seek bar), the stub strip (can_target False now, so the press
+        # is targeted to the content below it), CSD edges — BEFORE any
+        # descendant's bubbling handler, and before GTK's titlebar
+        # machinery can route anything to show_window_menu (refused at
+        # import anyway).  The menu opens when the sequence ENDS; the
+        # press stores both the gesture-space point (widget coords) and
+        # the same instant in device space (surface coords), so drift is
+        # measured within one coordinate space and the constant offset
+        # between the two cancels out.
+        self._rclick_top_pt = None
+        if int(n_press) != 1:
+            return
+        self._rclick_top_pt = (float(x), float(y), self._rclick_dev_pt())
+
+    def _on_rclick_top_end(self, _gesture, *_a) -> None:
+        # Gesture::end — fires for this capture gesture even after a
+        # descendant CLAIM has silenced ``released`` (the seek-bar case).
+        pt, self._rclick_top_pt = self._rclick_top_pt, None
+        if pt is None:
+            return
+        x, y, dev0 = pt
+        dev1 = self._rclick_dev_pt()
+        if dev0 is not None and dev1 is not None:
+            dx, dy = dev1[0] - dev0[0], dev1[1] - dev0[1]
+            if abs(dx) > 12 or abs(dy) > 12:
+                return      # right-button DRAG: no menu (the R6-A rule)
+            self._open_context_menu(x + dx, y + dy)
+        else:
+            self._open_context_menu(x, y)
+
+    def _on_rclick_top_cancel(self, *_a) -> None:
+        self._rclick_top_pt = None
 
     def _open_context_menu(self, x: float, y: float) -> None:
         """Fresh snapshot-derived model, popped up AT the pointer.
@@ -600,8 +1038,12 @@ class ReelseeWindow(Gtk.ApplicationWindow):
             return ""
         if on:
             self._aspect_forget()      # free NOW: crop wants a free box
+            # R14-B: and the DECLARE goes too — a WM that still enforced
+            # PAspect would undo the crop on the next drag.
+            self._aspect_hints_apply()
             return "  ·  aspect lock paused"
         self._aspect_realign()
+        self._aspect_hints_apply()     # R14-B: lock back, hints back
         return ""
 
     def _sync_crop_action(self, on: bool) -> None:
@@ -625,21 +1067,55 @@ class ReelseeWindow(Gtk.ApplicationWindow):
             h.set_child(None)
             self.overlay.set_child(self.view.area)
 
+    def _set_top_handle_active(self, on: bool) -> None:
+        """R15-A: header draggability is WINDOWED-ONLY, the exact rule R5-D
+        established for the video handle.  Fullscreen swaps the header's
+        Gtk.WindowHandle OUT and re-parents the bare strip into the very
+        same slot (first overlay child, so the z-order contract holds),
+        making a fullscreen header drag structurally a no-op.  Windowed
+        re-mounts the handle around the strip."""
+        h = self._top_handle
+        if on:
+            if h.get_parent() is self.overlay:
+                return
+            if self.top_bar.get_parent() is self.overlay:
+                self.overlay.remove_overlay(self.top_bar)
+            h.set_child(self.top_bar)
+            # first overlay child = right after the base (video) child
+            h.insert_after(self.overlay, self.overlay.get_child())
+        else:
+            if h.get_parent() is None and (
+                    self.top_bar.get_parent() is self.overlay):
+                return
+            if h.get_parent() is not None:
+                self.overlay.remove_overlay(h)
+            h.set_child(None)
+            self.top_bar.insert_after(self.overlay,
+                                      self.overlay.get_child())
+
     def _build_top_chrome(self) -> Gtk.Box:
         """R12: the top overlay strip — media title plus OUR OWN window
         controls (minimise / maximise-restore / close).  It is an overlay
         child, not a titlebar: retracting it only fades opacity, and no
-        button starts a window drag (there is no WindowHandle above it)
-        nor toggles playback (a press is claimed by the button and can
-        never reach the video's click gesture underneath)."""
+        button starts a window drag (R15-A wrapped the strip in a
+        Gtk.WindowHandle, but a press on a button is claimed by the
+        button itself and can never reach the handle's drag gesture;
+        the video's click gesture underneath is equally unreachable).
+
+        R15-C: FLUSH at the window edges — no margins on any side, so
+        the strip's dark background IS the top edge of the client area
+        (a margin here renders as a transparent rim over live video,
+        which is exactly what round 15 removes).  Breathing room lives
+        INSIDE: title-label padding and the buttons' own padding.  The
+        strip still holds no layout slot, so R12's byte-identical
+        video allocation (revealed vs hidden) is untouched."""
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         bar.set_valign(Gtk.Align.START)
         bar.set_halign(Gtk.Align.FILL)
         bar.add_css_class("reelsee-chrome")
-        bar.set_margin_top(4)
-        bar.set_margin_start(6)
-        bar.set_margin_end(6)
         self._title_label.set_hexpand(True)
+        self._title_label.set_margin_start(8)     # spacing INSIDE the
+        self._title_label.set_margin_end(4)       # flush strip
         bar.append(self._title_label)
         self.btn_min = Gtk.Button(icon_name="window-minimize-symbolic")
         self.btn_max = Gtk.Button(icon_name="window-maximize-symbolic")
@@ -650,6 +1126,7 @@ class ReelseeWindow(Gtk.ApplicationWindow):
             b.add_css_class("reelsee-chrome")
             b.set_tooltip_text(tip)
             bar.append(b)
+        self.btn_close.set_margin_end(8)
         # The controls act on the window and NOTHING else — each handler
         # is one window call (the gate spy-invokes all three).  Dynamic
         # dispatch (self.minimize()…), so tests can substitute the window
@@ -676,6 +1153,135 @@ class ReelseeWindow(Gtk.ApplicationWindow):
                 else "window-maximize-symbolic")
         self.btn_max.set_tooltip_text("Restore" if maxed else "Maximise")
 
+    # -------------------------------- R17-C: app-owned window move --
+    def _on_move_drag_begin(self, gesture, start_x, start_y, which) -> None:
+        """NOTHING happens here but recording the origin.
+
+        `Gtk.GestureDrag::drag-begin` is emitted on the PRESS, not when the
+        pointer has travelled (measured on this GTK 4.22.4 build: a plain
+        press+release in the middle of the video area emitted drag-begin and
+        a begin_move there swallowed click-to-pause entirely).  The move is
+        therefore started at the THRESHOLD CROSSING, in _on_move_drag_update,
+        exactly as the round-17 brief specifies; a press that never travels
+        stays a click for the app's own click gestures.
+        """
+        if self._closing:
+            return
+        self._move_pending[which] = {
+            "x": float(start_x),
+            "y": float(start_y),
+            "thr": _drag_threshold_px(),
+            "dev": gesture.get_current_event_device(),
+            "button": gesture.get_current_button(),
+            "time": gesture.get_current_event_time(),
+        }
+
+    def _on_move_drag_update(self, gesture, off_x, off_y, which) -> None:
+        """Threshold crossing => start the move, once."""
+        pend = self._move_pending.get(which)
+        if pend is None:
+            return
+        thr = pend.get("thr") or self._move_threshold
+        if math.hypot(float(off_x), float(off_y)) < thr:
+            return
+        self._move_pending.pop(which, None)
+        self._begin_move(gesture, pend, which)
+
+    def _on_move_drag_end(self, gesture, *_a) -> None:
+        """Released before the threshold: forget the origin so the press
+        stays a click (and a later drag on the other handle starts clean)."""
+        self._move_pending.clear()
+
+    def _begin_move(self, gesture, pend: dict, which: str) -> None:
+        """R17-C: THE app-owned window move — one mechanism, shipped on
+        purpose.  `Gdk.Toplevel.begin_move` IS introspectable on this
+        build (`begin_move(self, device:Gdk.Device, button:int, x:float,
+        y:float, timestamp:int)`) and is reachable from Python through the
+        toplevel SURFACE (`widget.get_surface()`), so the move is started
+        with the CURRENT event's device, button and time — no raw Xlib
+        client message, no `_NET_WM_MOVERESIZE` reimplementation, no
+        dependency on `src/x11pos.py`.  On X11 GDK turns the call into the
+        same `_NET_WM_MOVERESIZE` MOVE the C gesture used to send (probe:
+        the x we passed appears verbatim in the wire message), so the WM
+        drives the move and the observable behaviour of R5-D/R15-A is
+        unchanged.
+
+        The sequence is CLAIMED afterwards: the retained C `GestureDrag`
+        (kept on purpose, R17-A) would otherwise initiate a SECOND move —
+        probe-proven 2 dir-8 messages without the claim, 1 with it.  The
+        claim is also what keeps "a drag never toggles pause" working: the
+        app's click gestures are cancelled with the sequence.
+
+        If begin_move raises there is no claim, so the retained C drag
+        still moves the window — a graceful fallback, never an exception
+        on the main thread.
+        """
+        if self._closing:
+            return
+        top = self.get_surface()
+        if top is None or not isinstance(top, Gdk.Toplevel):
+            return
+        dev = pend.get("dev")
+        if dev is None:
+            dev = gesture.get_current_event_device()
+        if dev is None:
+            # A gesture with no live sequence reports no device (a11y- or
+            # test-synthesised drags); fall back to the seat pointer so the
+            # move still starts instead of silently refusing.
+            disp = self.get_display()
+            seat = disp.get_default_seat() if disp is not None else None
+            dev = seat.get_pointer() if seat is not None else None
+        if dev is None:
+            log.debug("R17-C: %s drag has no pointer device; native drag "
+                      "stands", which)
+            return
+        try:
+            button = int(pend.get("button") or gesture.get_current_button()
+                         or 1)
+            when = int(pend.get("time") or gesture.get_current_event_time())
+            top.begin_move(dev, button, float(pend["x"]), float(pend["y"]),
+                           when)
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        except Exception as exc:                    # noqa: BLE001
+            log.debug("R17-C: %s begin_move refused (%s); native drag "
+                      "stands", which, exc)
+            return
+        self._move_initiated += 1
+        log.debug("R17-C: %s drag initiated begin_move(button=%d, t=%d)",
+                  which, button, when)
+
+    # --------------------------- R17-A: header double-click maximise --
+    def _on_header_press(self, _gesture, n_press, x, y, *_a) -> None:
+        """Double-click on the header toggles maximise/restore — the
+        behaviour the removed C click gesture carried via
+        `gtk-titlebar-double-click`.  Presses inside a window control
+        button belong to the button (double-clicking Close must close, not
+        maximise), so they are excluded by hit-test."""
+        if int(n_press) < 2 or self._closing:
+            return
+        if self._header_hit_button(x, y):
+            return
+        self._on_maxrestore_clicked()
+
+    def _header_hit_button(self, x: float, y: float) -> bool:
+        """True when a press at header-strip coordinates (x, y) lands on one
+        of the three window control buttons.
+
+        `Gtk.Widget.compute_bounds` is a vfunc binding: it returns
+        `(success, Graphene.Rect)`, NOT a bare rect — and `Graphene.Rect`
+        exposes its fields ONLY through getters (`get_x/get_y/get_width/
+        get_height`; there is no `.x` attribute).  Reading `.x` raises
+        AttributeError on the GTK main thread, so the success flag is
+        checked first and the getters are used."""
+        for b in (self.btn_min, self.btn_max, self.btn_close):
+            ok, r = b.compute_bounds(self.top_bar)
+            if not ok or r is None:
+                continue
+            rx, ry = r.get_x(), r.get_y()
+            if rx <= x < rx + r.get_width() and ry <= y < ry + r.get_height():
+                return True
+        return False
+
     def _apply_reveal(self, visible: bool) -> None:
         """R12: the single reveal path — Chrome crossfades EVERY reveal
         group (bottom bar AND the top strip with the window controls)
@@ -690,6 +1296,8 @@ class ReelseeWindow(Gtk.ApplicationWindow):
 
     def _on_active(self, *_a) -> None:
         if self.is_active():
+            # R16-A: focus is a STATE change — fast cadence first.
+            self._tick_arm("focus")
             self.app.on_window_focus(self)
 
     def transient_mute(self, on: bool) -> None:
@@ -698,6 +1306,200 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         self._transient_muted = bool(on)
         self.core.set_property(
             "mute", bool(on) or bool(self.cfg.get("audio.muted", False)))
+
+    # ------------------------------------- R16-B: hidden-video suppression --
+    # A minimized window is an UNMAPPED surface: the user cannot see a single
+    # frame of it, yet mpv kept decoding (a 4K stream at full rate) to feed a
+    # render path nobody looks at — CPU/GPU bandwidth the visible windows
+    # need.  So `vid` goes off with the surface and back with it.
+    #
+    # The trigger is mapping ONLY (`notify::mapped`; under X11/XWayland an
+    # iconified toplevel is unmapped by the server, which is exactly the case
+    # the operator's session produces).  Fullscreen enter/leave keeps the
+    # surface mapped and therefore never touches this.  Nothing else is
+    # written: audio is never muted here, `pause` is never written, and no
+    # window is ever auto-paused — the position keeps advancing, which is
+    # what "I minimized it and it carried on" means.
+    def _vid_write(self, value: str, why: str) -> None:
+        """The ONE writer of mpv's `vid` property (R16-B)."""
+        self.core.set_property("vid", value)
+        log.debug("vid=%s (%s)", value, why)
+
+    def _apply_vid(self, value: str, why: str) -> None:
+        """Record/apply the USER's own video-track choice (audio-only switch,
+        an explicitly picked track, `auto`).  While a suppression holds the
+        decoder off the EFFECTIVE value stays `no` — a file loading into a
+        hidden window must not turn decoding back on — but the choice is
+        remembered, so the remap restores THAT and not a bland `auto` that
+        quietly picks a different track."""
+        eff = self._vidsup.user_wants(value)
+        self._vid_write(eff, why)
+        if eff != vidsup.norm_vid(value):
+            log.debug("vid=%s recorded for remap (%s)", eff, why)
+
+    # The bits `Gdk.Surface.get_state()` was MEASURED to report (0x10001) on a
+    # toplevel the window manager unmapped, while `Gtk.Window.mapped` stayed
+    # True (scratch/probe_state_x.py, round 16; the same reading came from
+    # scratch/probe_mapped.py).  This GTK build exposes neither
+    # `Gdk.SurfaceState` to Python (`AttributeError`) nor
+    # `gdk_surface_state_get_type` in libgtk-4, so the mask is the OBSERVED
+    # number, not an enum name — see DSH-REPORT-R16.md for the measurements.
+    _SURFACE_STATE_UNMAPPED_BITS = 0x10001
+
+    def _surface_state(self) -> int:
+        """Cached C read of the surface state flags (no round trip).  A seam
+        the hiddensuppress gate drives to replay the window-manager case."""
+        surf = self.get_surface()
+        if surf is None:
+            return 0
+        try:
+            return int(surf.get_state())
+        except Exception:                       # noqa: BLE001
+            return 0
+
+    def _surface_hidden(self) -> bool:
+        """R16-B: is this window's surface off-screen?
+
+        TWO independent facts, OR-ed, because neither alone is enough and
+        both were MEASURED here, not assumed:
+
+        * `Gtk.Window.mapped` — GTK's own mapping.  It follows
+          `set_visible()` (and a Wayland hide), but under the X11 backend it
+          does NOT follow an unmap the WINDOW MANAGER performs: GTK4 has no
+          signal for a surface state change, so a real GNOME minimize leaves
+          `get_mapped()` True.
+        * the surface state bits the X11 backend leaves set once the WM has
+          unmapped us (`_SURFACE_STATE_UNMAPPED_BITS`).
+
+        Fullscreen enter/leave sets neither (measured: state stays 0 and the
+        surface stays mapped), so it never suppresses."""
+        if not self.get_mapped():
+            return True
+        return bool(self._surface_state() & self._SURFACE_STATE_UNMAPPED_BITS)
+
+    def _on_mapped_changed(self, *_a) -> None:
+        """R16-B: minimize/unmap stops decoding, remap restarts it.
+
+        Nothing but `vid` is ever written here: audio is never muted,
+        `pause` is never written, no window is ever auto-paused — the
+        position keeps advancing, which is what "I minimized it and it
+        carried on" means."""
+        self._sync_hidden_suppression("notify::mapped")
+
+    def _sync_hidden_suppression(self, why: str) -> None:
+        """Reconcile mpv with the CURRENT hidden state.
+
+        Called from `notify::mapped` AND from the pump tick (`tick_pump`,
+        which R16-A never suspends — a minimized window still has a pump,
+        so it still notices it was minimized).  `VidSuppression.sync` is
+        transition-only, so a 100 ms re-statement writes nothing until the
+        state actually flips."""
+        if self._closing:
+            return
+        hidden = self._surface_hidden()
+        if hidden == self._vidsup.hidden:
+            return
+        val = self._vidsup.sync(hidden)
+        if hidden:
+            self._vid_release = val
+            if val is not None:
+                self._vid_write("no", f"unmap ({why})")
+                log.info("hidden-video suppress (%s, %s): vid=no (audio, "
+                         "pause and position untouched)", why, self._vidsup.user_vid)
+            else:
+                log.debug("hidden-video suppress (%s): nothing to stop "
+                          "(setting off, or video already off)", why)
+        else:
+            self._vid_release = None
+            if val is not None:
+                self._vid_write(val, f"remap ({why})")
+                log.info("hidden-video restore (%s): vid=%s", why, val)
+
+    def _reassert_vid(self, _mode=None) -> None:
+        """R16-B: after anything that toggles `vid` (a decoder switch via
+        apply_hwdec, an engine retry), re-state `no` when `no` is what this
+        window must hold.  The proven switch ends with `set vid auto`, which
+        would otherwise (a) bring a hidden window's decoder back to life and
+        (b) undo the user's audio-only switch.
+
+        Deliberately narrow: with nothing to hold, NOTHING is written — the
+        window-open path must not get a stray `vid=no` before the surface
+        has ever mapped."""
+        if self._vidsup.suppressed or self._vidsup.user_vid == "no":
+            self._vid_write("no", "hwdec re-assert")
+
+    def _set_suppress_enabled(self, flag) -> None:
+        """The live settings flip (playback.suppress_video_when_hidden)."""
+        val = self._vidsup.set_enabled(flag)
+        if val is not None:
+            self._vid_write(val, "suppress setting")
+
+    # ------------------------------------------------- R16-C thread budget
+    def _cpu_decoding(self) -> bool:
+        """Is this window ACTUALLY decoding on the CPU?
+
+        The observed `hwdec-current` snapshot value is the only honest signal
+        (R9: the main thread never calls a sync mpv getter; R2-P2: a
+        configured GPU engine that silently failed must read CPU, never GPU).
+        `unknown` — before the first frame — counts as not-yet-CPU, so a
+        window that has not decoded anything is never handed a number."""
+        return WD.decode_effective(
+            self.core.snapshot.get("hwdec-current")) == "off"
+
+    def apply_thread_budget(self, threads: int) -> None:
+        """R16-C: hand this window its share of the CPU decode budget.
+
+        ONLY CPU-decoded windows are touched — the brief forbids rewriting a
+        GPU window's lavc thread count (harmless, but it makes the setting
+        untraceable).  `threads <= 0` means auto, and mpv has no way back to
+        auto once a number has been written, so a window that opens as the
+        only window is simply never given one.
+
+        Honest limitation: `vd-lavc-threads` is runtime-settable (measured:
+        `set_property_string` returns success) but lavc applies it when the
+        decoder is (re)initialised, so a change lands on the next file load or
+        decoder re-init — never mid-stream.  Nothing here forces a re-init,
+        because forcing one would blank the picture for the sake of a thread
+        count."""
+        if self._closing or threads <= 0 or not self._cpu_decoding():
+            return
+        want = str(int(threads))
+        if self._lavc_threads == want:
+            return
+        self._lavc_threads = want
+        try:
+            self.core.set_property("vd-lavc-threads", want)
+            log.info("decode thread budget: %s threads (cpu-decoded window)",
+                     want)
+        except Exception:                       # noqa: BLE001
+            log.exception("thread budget write failed")
+
+    # ------------------------------------------------------ R16-D decode plan
+    def gpu_decoding(self) -> bool:
+        """R16-D: is this window ACTUALLY decoding on a GPU?  `unknown` (no
+        frame decoded yet) is deliberately False — a window nobody has seen
+        decode anything is not a stream the GPU is carrying."""
+        return WD.decode_effective(
+            self.core.snapshot.get("hwdec-current")) == "on"
+
+    def demote_to_cpu(self, reason: str = "plan") -> None:
+        """R16-D: move THIS window to CPU decode.
+
+        The mechanism is the one AGENTS.md proves: `set hwdec` alone never
+        reinitialises the decoder, so this goes through apply_engine →
+        apply_hwdec, which performs set hwdec → set vid no → set vid auto and
+        leaves the position alone.  `_decode_auto` marks the demotion as
+        AUTOMATIC (the indicator reads "CPU (auto)"), never a user override —
+        the same flag R7-B introduced for watchdog demotes."""
+        if self._closing:
+            return
+        try:
+            cpu = engine.select_engine("cpu", engine.enumerate_engines())
+            engine.apply_engine(self.core, cpu, self.cfg)
+            self._set_decode_flags(self._decode_user, True)
+            log.info("decode plan: demoted to CPU (%s)", reason)
+        except Exception:                       # noqa: BLE001
+            log.exception("decode plan demotion failed (%s)", reason)
 
     # ------------------------------------------------------------- lifecycle
     def open_target(self, target: str) -> None:
@@ -853,12 +1655,14 @@ class ReelseeWindow(Gtk.ApplicationWindow):
                 str(self.cfg.get("video.scale_preset", "default")),
                 {}).items():
             self.core.set_property(prop, val)
-        self.core.set_property(
-            "vid", "no" if self.cfg.get("playback.video_off", False)
-            else "auto")
+        self._apply_vid("no" if self.cfg.get("playback.video_off", False)
+                        else "auto", "file-load")
 
     def _on_file_loaded(self, _core, _payload) -> None:
         c = self.cfg
+        # R16-A: a new file is a STATE change — it can show the chrome, and
+        # it definitely starts pictures moving.  Fast cadence from here.
+        self._tick_arm("file")
         # R7-B: the per-video decode override is MEMORY ONLY and dies with
         # the file — next/prev, another file, a new window: every load
         # starts by trying the configured (GPU) engine again.
@@ -1024,6 +1828,30 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         self._update_title()
         self.chrome.update_snapshot(core.snapshot)
         self._sync_menus()
+        # R14-B: the video size is a fact that ARRIVES (dwidth/dheight land
+        # after file-loaded, and vanish on stop) — whenever the pair the
+        # hints would publish changes, re-declare it.  Diffed on purpose:
+        # this listener runs at least every 50 ms, and a property write per
+        # tick would be a new performance bug in the shape fix.
+        pair = self._aspect_hints_pair()
+        if pair != self._aspect_hints_seen:
+            self._aspect_hints_seen = pair
+            self._aspect_hints_soon()
+        # R16-C: a window's decode path is a fact that ARRIVES — hwdec-current
+        # is unknown until the first frame decodes, and a watchdog demotion
+        # flips it later.  The thread budget is a function of how many windows
+        # are CPU-decoded, so the budget is recomputed on that edge.  Diffed
+        # on purpose: this listener runs at least every 50 ms.
+        hw = self.core.snapshot.get("hwdec-current")
+        if hw != self._hwdec_seen:
+            self._hwdec_seen = hw
+            hook = getattr(self.app, "on_decode_state_changed", None)
+            if hook is not None:
+                hook(self)
+            else:
+                retune = getattr(self.app, "retune_decode_threads", None)
+                if retune is not None:
+                    retune()
 
     # ---------------------------------------------------------------- resume
     def _resume_record(self, *, force: bool) -> None:
@@ -1101,12 +1929,46 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         # decorated WM title.
         self._title_label.set_label(str(name) if name else "REELSEE")
 
-    def _tick(self) -> bool:
-        if self._closing:
-            return False
+    def _tick_arm(self, _why: str = "") -> None:
+        """R16-A: the ONE cadence re-arm entry point.
+
+        Every input and state edge reaches it — pointer motion/click/hover/
+        leave and key, menu open/close, OSD/toast presentation and the
+        observed play/pause edge through `Chrome.on_activity`, plus window
+        focus and file load here.  It runs BEFORE any visual work: the fast
+        cadence (and, after an idle stretch, the chrome source itself) is
+        back before a single widget is touched, so a suspended window cannot
+        swallow the first motion.
+        """
+        d = self._driver
+        if d is None:
+            return                    # still constructing: nothing to wake
+        d.arm()
+
+    @property
+    def tick_interval_ms(self) -> int | None:
+        """R16-A: the chrome source's CURRENT interval — 10 / 100 / None
+        (None == no source at all, i.e. suspended while hidden).  The
+        introspectable surface the gates read; never a re-derivation."""
+        d = self._driver
+        return None if d is None else d.current_ms
+
+    @property
+    def pump_interval_ms(self) -> int | None:
+        """R16-A: the pump source's CURRENT interval (10 / 100; the pump is
+        never suspended while the window lives)."""
+        d = self._driver
+        return None if d is None else d.pump_current_ms
+
+    def tick_reveal(self) -> None:
+        """The CHROME half of the old tick: one ChromeState step, applied."""
+        self._apply_reveal(self.chrome.tick())
+
+    def tick_pump(self) -> None:
+        """The PUMP half of the old tick — everything that must keep being
+        drained no matter what the chrome is doing (R16-A split)."""
         self.view.poll()
         self.core.poll()
-        self._apply_reveal(self.chrome.tick())
         if self._url_resolver is not None:
             # R2-P3/I2: resolver results are delivered by THIS main-thread
             # poll draining the worker's queue — never GLib from the worker.
@@ -1121,9 +1983,18 @@ class ReelseeWindow(Gtk.ApplicationWindow):
                 log.exception("next-probe delivery failed")
         if self._engagement is not None and self._engagement.armed:
             # R2-P2: cheap snapshot read every poll (R9/R10: observed only)
+            # R17-D: while the file is still buffering the engagement
+            # deadline is FROZEN — an engine that engages late because the
+            # cache was still filling is not an engagement failure.
+            snap = self.core.snapshot
             self._engagement.feed(
-                self.core.snapshot.get("hwdec-current"))
-        return True
+                snap.get("hwdec-current"),
+                buffering=WD.is_buffering(snap.get("paused-for-cache"),
+                                          snap.get("cache-buffering-state")))
+        # R16-B: the pump is the ONE place a minimized window still runs
+        # (R16-A never suspends it), so it is where the WM-iconified case is
+        # noticed.  Transition-only: no mpv write until the state flips.
+        self._sync_hidden_suppression("pump")
 
     def _watchdog_tick(self) -> bool:
         if self._closing:
@@ -1136,6 +2007,8 @@ class ReelseeWindow(Gtk.ApplicationWindow):
                         and str(action.get("to")) == "no"):
                     # R7-B: reached CPU AUTOMATICALLY (overload demote) —
                     # indicator shows "CPU (auto)", NOT a user override.
+                    # R16-C's thread retune rides on the hwdec-current edge
+                    # this demote produces, so nothing else is needed here.
                     self._set_decode_flags(self._decode_user, True)
         except Exception:                       # noqa: BLE001
             log.exception("watchdog tick failed")
@@ -1145,7 +2018,11 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         # §0.6: probes/state first (nothing yet in P2), then GL-current
         # render-context teardown; terminate happens on the app's worker.
         self._cancel_single()            # R5-D: no pause toggle post-mortem
-        GLib.source_remove(self._tick_id)
+        # R16-A: BOTH cadence sources die here (chrome + pump).  The
+        # `_closing` guard in the callbacks is the belt for paths that never
+        # fire close-request.
+        if self._driver is not None:
+            self._driver.stop()
         GLib.source_remove(self._wd_id)
         if self._resume_id is not None:
             GLib.source_remove(self._resume_id)
@@ -1153,7 +2030,8 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         # R8-B: a pending correction or a file-poll outliving the window
         # would resize a dead surface (and spam a traceback per tick).
         for _sid in ("_aspect_debounce_id", "_aspect_guard_id",
-                     "_aspect_file_id"):
+                     "_aspect_file_id", "_aspect_hints_id",
+                     "_aspect_hints_wsrc"):
             _src = getattr(self, _sid, None)
             if _src is not None:
                 GLib.source_remove(_src)
@@ -1352,6 +2230,11 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         recorded (§A.2), so nothing downstream can remember it by accident."""
         if self._closing:
             return False
+        if not self.get_mapped():
+            # R16-B: an unmapped window has no live rect worth sampling —
+            # GTK reports the last realized size, and treating that as news
+            # is how a minimize turns into a resize storm on restore.
+            return True
         try:
             if self._geom_windowed():
                 live = self._geom_live_rect()
@@ -1464,6 +2347,16 @@ class ReelseeWindow(Gtk.ApplicationWindow):
             return
         self._aspect_surf = surf
         surf.connect("layout", self._on_surface_layout)
+        # R14-B: the XID (and with a replaced surface, a BRAND-new one,
+        # whose WM_NORMAL_HINTS start empty) only exists while the surface
+        # is real — re-declare the hints on every re-wire, debounced so a
+        # fullscreen surface swap is ONE property write, not the storm.
+        # The clobber watch is per window too: disarmed here, the
+        # resulting republish re-arms it on the NEW window.
+        if self._aspect_hints_wsrc is not None:
+            GLib.source_remove(self._aspect_hints_wsrc)
+            self._aspect_hints_wsrc = None
+        self._aspect_hints_soon()
 
     def _on_surface_layout(self, _surface, width, height, *_args) -> None:
         """A size the user or the compositor already gave us.
@@ -1487,8 +2380,19 @@ class ReelseeWindow(Gtk.ApplicationWindow):
             size = (int(width), int(height))
         except (TypeError, ValueError):
             return
+        if not self.get_mapped():
+            # R16-B: no corrections on a hidden surface.  A minimized window
+            # that "corrects" itself asks for a resize nobody can see, and
+            # the answer comes back as a burst the moment it maps again.
+            return
         same = (size == self._aspect_size)
         self._aspect_size = size
+        if not same:
+            # R14-B: GDK rewrites WM_NORMAL_HINTS itself when its own
+            # content min-size changes — a real resize can silently wipe
+            # our PAspect words, so every genuine size change re-declares
+            # them (debounced; a repaint storm never gets here).
+            self._aspect_hints_soon()
         if self._aspect_applying:
             return          # our own resize echoing back is not a new event
         if not self._aspect_locked():
@@ -1535,6 +2439,13 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         application window on this build (Gtk.Window.resize() does not
         exist).  The guard is armed BEFORE the call because the answer
         arrives through the very signal we are reacting to."""
+        if not self.get_mapped():
+            # R16-B: THE choke point — no aspect correction can reach a
+            # hidden surface from ANY caller (layout storm, file-load fit,
+            # realign), so a minimized window never queues a resize that
+            # lands as a storm the moment it maps again.
+            log.debug("aspect correction skipped while unmapped: %s", size)
+            return
         self._aspect_applying = True
         self._aspect_applied = size
         self._aspect_corrections += 1
@@ -1581,6 +2492,136 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         self._apply_aspect_size(aspect.fit_aspect(size[0], size[1], a,
                                                   max_w=wa_w, max_h=wa_h))
 
+    # ------------------------------------------------ R14-B: WM_NORMAL_HINTS
+    def _aspect_hints_pair(self) -> tuple[int, int] | None:
+        """The PAspect pair for the video on screen NOW, or None.
+
+        Source rule, the same one §R8-B established for the correction:
+        the OBSERVED display size (dwidth/dheight — what a rotated or
+        vertical file actually occupies), falling back to the coded size
+        only until the display size has arrived.  Never the container,
+        never config.video_aspect, never a re-derived value.
+
+        One measured edge forces exactly ONE concession: entering
+        fullscreen re-inits the video output — dwidth/dheight go blank
+        and are NOT re-emitted while the file keeps playing (measured on
+        HEAD under both Xvfb and a real X display; §R8-B's live-snapshot
+        correction goes blind at the very same moment, for the very same
+        reason).  The requirement still demands RESTORE on fullscreen
+        leave, so with no live dimensions we fall back to the last pair
+        seen — but only while the core still holds a file (`idle-active`
+        False).  Real boundaries forget the memory outright: _act_stop
+        and every file-load edge, the idle flag itself covers EOF unload.
+        This is a memory of an OBSERVED value at a known-transient edge,
+        not a parallel source of truth."""
+        snap = self.core.snapshot or {}
+        for wk, hk in (("dwidth", "dheight"), ("width", "height")):
+            pair = aspect.paspect_pair(snap.get(wk), snap.get(hk))
+            if pair is not None:
+                return pair
+        if self._aspect_hints_seen is None:
+            return None
+        if snap.get("idle-active"):
+            self._aspect_hints_seen = None        # the file is gone
+            return None
+        return self._aspect_hints_seen
+
+    def _aspect_hints_apply(self) -> None:
+        """Declare the lock in the ONE language a window system hears on
+        X11: WM_NORMAL_HINTS with PAspect (R14-B).  GTK 4 deleted geometry
+        hints, so without this the window manager never even tries to keep
+        the ratio during a drag, and §R8-B's post-hoc correction is a
+        mid-drag fight the compositor always wins.
+
+        Cleared whenever the lock is not ACTIVE — the single truth
+        aspect_lock_active (setting off, crop-to-window on per R11,
+        fullscreen, maximized) — or there is no video to lock to.  The
+        post-hoc correction keeps running untouched: with hints honoured
+        it usually has nothing to correct (its >1 px gate is already
+        satisfied), on Wayland and on hint-ignoring servers it remains
+        the whole mechanism.  Both x11pos entries degrade to False —
+        publish failure is invisible, the correction path simply keeps
+        its old job."""
+        if self._closing:
+            return
+        pair = self._aspect_hints_pair() if self._aspect_locked() else None
+        if pair is None:
+            x11pos.clear_aspect_ratio(self)
+            self._hints_watch(False)
+        else:
+            x11pos.set_aspect_ratio(self, pair[0], pair[1])
+            self._hints_watch(True)
+
+    def _hints_watch(self, want: bool) -> None:
+        """R14-B, and the reason this is a WATCH and not a one-shot:
+        measured with a PropertyChange subscription on our own window
+        (scripts/smoke_aspecthints.py, storm_* phases), GDK's X11 backend
+        rewrites WM_NORMAL_HINTS WHOLESALE — its own flags and min-size,
+        PAspect gone — on EVERY DRAWN FRAME (~2 notifications per frame
+        at 30 fps), and writes nothing at all while paused.  A publish
+        made at a state edge therefore survives pauses, idling and every
+        listed refresh edge, but is erased within one frame of playback.
+        So while the declaration is up we hold an event selection on it
+        (per-client — GDK pays nothing) and repair on notice.  The repair
+        is a property write, never a resize: §R8-B's geometry-storm rules
+        are untouched and cannot be entered from here.
+
+        Event selection is per window: a replaced surface is a NEW XID
+        with a fresh (empty) property, so _wire_aspect_surface drops the
+        arm and the resulting republish re-arms on the right window."""
+        if self._closing:
+            return
+        if want:
+            if self._aspect_hints_wsrc is not None:
+                return
+            fd = x11pos.watch_hints(self)         # selects + hands us fd
+            if fd is None:
+                return                            # Wayland / no Xlib
+            self._aspect_hints_wsrc = GLib.io_add_watch(
+                fd, GLib.IO_IN, self._on_hints_io)
+        elif self._aspect_hints_wsrc is not None:
+            GLib.source_remove(self._aspect_hints_wsrc)
+            self._aspect_hints_wsrc = None
+            x11pos.unwatch_hints(self)
+
+    def _on_hints_io(self, _source, cond) -> bool:
+        """Our X connection has readable data: drain it (unread events
+        would pile up forever on the shared connection), and if anyone
+        touched WM_NORMAL_HINTS, re-declare NOW — undebounced, because
+        the arithmetic of a debounced repair is fatal: GDK rewrites at a
+        ~33 ms cadence while drawing, so any debounce LONGER than that
+        leaves the property cleared for most of every second.  The repair
+        is property-only (never a resize, so §R8-B's geometry-storm rules
+        cannot be entered from here) and it self-converges: our own write
+        echoes back as one more notice, the second apply reads the
+        already-exactly-right words and writes NOTHING (x11pos early-
+        return), so notice storms end after one round-trip each.  A dead
+        socket (ERR|HUP) drops the watch; x11pos drops the connection on
+        its own next use."""
+        if self._closing or cond & (GLib.IO_ERR | GLib.IO_HUP
+                                    | GLib.IO_NVAL):
+            self._aspect_hints_wsrc = None
+            return False
+        if x11pos.hint_notices(self):
+            self._aspect_hints_apply()
+        return self._aspect_hints_wsrc is not None
+
+    def _aspect_hints_soon(self, *_a) -> None:
+        """Debounced republish for storm-prone EDGES (layout size change,
+        snapshot churn, surface re-wire): ONE timer, ~200 ms — the
+        property write is cheap and idempotent, but the read-back behind
+        it should not happen ten times a second during a drag.  (The
+        per-frame clobber fight is NOT routed through here — see
+        _on_hints_io, which must repair immediately.)"""
+        if self._closing or self._aspect_hints_id is not None:
+            return
+        self._aspect_hints_id = GLib.timeout_add(200, self._aspect_hints_now)
+
+    def _aspect_hints_now(self) -> bool:
+        self._aspect_hints_id = None
+        self._aspect_hints_apply()
+        return False
+
     def _aspect_on_file(self, left: int = 20) -> bool:
         """§R8-B.4: a newly loaded video sizes the window to ITS aspect,
         inside 80 % of the work area — 1080x1920 opens tall, 3840x2160 opens
@@ -1601,6 +2642,10 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         if self._closing:
             self._aspect_file_id = None
             return False
+        # R14-B: a file-load boundary makes the previous clip's pair
+        # meaningless — forget it so the transient fallback below can
+        # never publish the OLD video's ratio into the new file's window.
+        self._aspect_hints_seen = None
         a = aspect.aspect_of(self.core.snapshot)
         if a is None:
             if left > 1:
@@ -1608,10 +2653,19 @@ class ReelseeWindow(Gtk.ApplicationWindow):
                     100, self._aspect_on_file, left - 1)
                 return False
             self._aspect_file_id = None
+            # R14-B: gave up — there is NO video to lock to (audio-only,
+            # or a file that never reports a size); hints come off so the
+            # box is free again.
+            self._aspect_hints_apply()
             self._geom_consume()         # nothing to refit anyway (R10-B.1)
             return False                 # audio-only / idle: leave it alone
         self._aspect_file_id = None
         self._aspect_applied = None      # new video: new aspect, retries OK
+        # R14-B: the NEW file's ratio goes to the window system NOW — even
+        # on the branches that do not resize (adopted geometry, already-
+        # right shape), because "don't move the window" never meant "let
+        # the WM resize it to any shape".
+        self._aspect_hints_apply()
         if self._geom_consume():
             # R10-B.1: THIS window opened at a size CHOSEN FOR IT — the
             # source window's exact pixel size or the remembered rect.  The
@@ -1660,6 +2714,9 @@ class ReelseeWindow(Gtk.ApplicationWindow):
             self._aspect_realign()
         else:
             self._aspect_forget()
+        # R14-B: the DECLARE follows the decision — hints on with the lock,
+        # off without it (off is total, and that includes the hints).
+        self._aspect_hints_apply()
         self.chrome.show_osd("aspect lock on" if new else "aspect lock off")
 
     # ---------------------------------------------------------------- actions
@@ -1884,15 +2941,24 @@ class ReelseeWindow(Gtk.ApplicationWindow):
             # R6-A: formatting shared with the context menu (ONE source)
             self._tr_list.append(self._row(
                 ctxmenu.track_label(t),
-                lambda kind=kind, t=t: self.core.command(
-                    "set", prop.get(kind, kind),
+                lambda kind=kind, t=t: self._track_pick(
+                    kind, prop.get(kind, kind),
                     "no" if t.get("selected") else str(t.get("id")))))
         for kind, label in (("video", "no video (audio only)"),
                             ("audio", "no audio"), ("sub", "no subtitles")):
             self._tr_list.append(self._row(
                 f"{'●' if self.core.snapshot.get(prop[kind]) in (False, 'no') else '○'}  {label}",
-                lambda kind=kind: self.core.command("set", prop[kind],
-                                                    "no")))
+                lambda kind=kind: self._track_pick(kind, prop[kind], "no")))
+
+    def _track_pick(self, kind: str, prop: str, value: str) -> None:
+        """Track menu write.  A VIDEO pick is a statement about whether we
+        decode video at all, so it goes through `R16-B`'s `_apply_vid` — a
+        hidden window must restore the user's choice, not "auto".  Audio and
+        subtitle tracks are plain property writes."""
+        if kind == "video":
+            self._apply_vid(value, "track menu")
+            return
+        self.core.command("set", prop, value)
 
     def _track_sel(self, tl):
         out = {}
@@ -2182,6 +3248,8 @@ class ReelseeWindow(Gtk.ApplicationWindow):
                 # "restore completely free resizing immediately": the guard
                 # and any queued correction go away with the setting.
                 self._aspect_forget()
+            self._aspect_hints_apply()           # R14-B: same declare,
+                                                 # settings-row writer
         elif key == "video.crop_to_window":      # R11 (video page)
             # apply_live already pushed panscan via PROPERTY_MAP; route
             # through the ONE writer so actions/checkmark/OSD agree.
@@ -2192,7 +3260,12 @@ class ReelseeWindow(Gtk.ApplicationWindow):
             # specified "affects the next window without restarting".
             pass
         elif key == "playback.video_off":          # §7 T1 audio-only mode
-            self.core.set_property("vid", "no" if value else "auto")
+            self._apply_vid("no" if value else "auto", "setting video_off")
+        elif key == "playback.suppress_video_when_hidden":
+            # R16-B: live flip.  Turning it OFF while a window is minimized
+            # hands the decoder back at once; turning it ON while minimized
+            # stops it.  No restart, no window rebuild.
+            self._set_suppress_enabled(value)
         elif key == "video.scale_preset":          # §7 T1 scaler preset pack
             for prop, val in C.SCALE_PRESETS.get(str(value), {}).items():
                 self.core.set_property(prop, val)
@@ -2287,17 +3360,25 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         self._aspect_free_until = time.monotonic() + 0.4
         # R5-D: draggability exists only while windowed (see _set_handle_active).
         self._set_handle_active(not self._fs)
+        # R15-A: the HEADER handle follows the exact same windowed-only
+        # rule — fullscreen must not present a draggable strip either.
+        self._set_top_handle_active(not self._fs)
         # R5-A: both edges re-arm the countdown — fullscreen retracts through
         # the SAME idle mechanism, and leaving fullscreen restores revealed
         # (the fresh wake-up reveals immediately via the normal tick).
         self.chrome.wake()
         self._apply_reveal(True)
         self._update_title()
+        # R14-B: fullscreen is not ours to constrain — _aspect_locked()
+        # now says "inactive" (or, on exit, "active" again) and the hints
+        # follow the same truth as the correction.
+        self._aspect_hints_apply()
 
     def _act_fullscreen_exit(self, _p=None) -> None:
         if self._fs or self.is_fullscreen():
             self.unfullscreen()
             self._set_handle_active(True)         # R5-D: drag back on
+            self._set_top_handle_active(True)     # R15-A: header drag too
             self._fs = False
             # R8-B: the RESTORE storm is the dangerous edge — this is where a
             # naive lock snaps a 1920x1080 window down to 450x800 because it
@@ -2307,12 +3388,23 @@ class ReelseeWindow(Gtk.ApplicationWindow):
             self.chrome.wake()           # R5-A: restored chrome is revealed
             self._apply_reveal(True)
             self._update_title()
+            # R14-B: windowed again — the ratio is declared again (the
+            # freeze above guards RESIZES, never the property write).
+            self._aspect_hints_apply()
 
     def _act_fullscreen_state(self) -> bool:
         return bool(self._fs or self.is_fullscreen())
 
     def _act_stop(self, _p=None) -> None:
         self.core.command("stop")
+        # R14-B: stop means "no video to lock to" — take the hints off
+        # NOW.  An _aspect_hints_apply() here would be wrong: the mpv
+        # dwidth→0 event has not arrived yet, so the (stale) snapshot
+        # would RE-publish the old pair.  The snapshot diff re-clears
+        # idempotently when the event lands (no second server write).
+        self._aspect_hints_seen = None     # no video, no memory of one
+        x11pos.clear_aspect_ratio(self)
+        self._hints_watch(False)
         self.chrome.show_osd("stopped")
 
     def _repeat_cycle(self) -> None:

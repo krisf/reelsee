@@ -123,9 +123,26 @@ BINDINGS: tuple[dict, ...] = (
                "some render paths; copy mode is the reliable default)"),
     dict(key="engine.renderer_override", page="decode", kind="renderer",
          label="Renderer GPU (applies after restart)"),
+    # R16-E §E.1/§E.2 (ROUND18 corrected): decode GPU is independent of the
+    # render GPU.  Empty = auto (the INTEGRATED GPU — display-bearing or not;
+    # the iGPU may carry the monitors — else CPU; never a dGPU); picking a
+    # node pins it, which is the documented escape hatch.
+    dict(key="playback.vaapi_device", page="decode", kind="vanode",
+         label="VAAPI decode node (new windows)",
+         note="empty = integrated GPU or CPU"),
     dict(key="engine.cpu_threads", page="decode", kind="scale",
          label="CPU threads (0 = auto)", minimum=0, maximum=32, step=1,
          digits=0),
+    # R16-D: how many streams the iGPU decodes at once; windows past it fall
+    # back to CPU.  scripts/bench_multidecode.py measures the right value.
+    dict(key="engine.decode_capacity", page="decode", kind="scale",
+         label="Decode GPU stream capacity", minimum=0, maximum=8, step=1,
+         digits=0),
+    # R16-B: the performance switch belongs next to the decode controls.
+    dict(key="playback.suppress_video_when_hidden", page="decode",
+         kind="switch",
+         label="Stop decoding video in minimized windows (audio keeps "
+               "playing)"),
     dict(key="engine.watchdog_enabled", page="decode", kind="switch",
          label="Auto-fallback on overload"),
     dict(key="engine.watchdog_fps_floor_pct", page="decode", kind="scale",
@@ -204,7 +221,9 @@ BINDINGS: tuple[dict, ...] = (
 )
 
 KINDS = {"switch", "scale", "combo", "entry", "options", "fallback",
-         "engine", "renderer"}
+         "engine", "renderer",
+         # R16-E §E.2: /dev/dri render-node picker (widget swap, count 1)
+         "vanode"}
 
 
 def binding_keys() -> list[str]:
@@ -413,7 +432,7 @@ class SettingsWindow:
             row.connect("notify::selected",
                         lambda r, _ps, k=key, ch=choices: self._commit(
                             k, ch[r.get_selected()]))
-        elif kind in ("engine", "renderer"):
+        elif kind in ("engine", "renderer", "vanode"):
             values, labels = self._selector_choices(kind, str(cur or ""))
             row = Adw.ComboRow(title=b["label"],
                                model=Gtk.StringList.new(labels))
@@ -529,6 +548,27 @@ class SettingsWindow:
                 labels = [f"{lb} (zero-copy, may fall back)"
                           if e.kind in ("vaapi", "vulkan", "auto") else lb
                           for lb, e in zip(labels, engines)]
+        elif kind == "vanode":
+            # §E.2: every render node, labelled with its PCI slot and card,
+            # plus "" = auto (§E.1).  Enumeration comes from _engines(), which
+            # tests replace wholesale — the row must render nodes it did not
+            # discover itself.  ROUND18: what keeps a node out of AUTO is
+            # being a discrete board add-in, NOT driving a display — the
+            # iGPU row must never imply it is skipped for carrying monitors.
+            auto = E.pick_decode_node()
+            values, labels = [""], ["Auto — integrated GPU, else CPU decode"]
+            for e in sorted((x for x in engines if x.render_node),
+                            key=lambda x: str(x.pci)):
+                tag = ""
+                if e.render_node == auto:
+                    tag = " — auto picks this"
+                elif e.is_discrete:
+                    tag = " — discrete GPU (auto never picks it)"
+                elif e.is_display_gpu:
+                    tag = " — drives the display"
+                values.append(e.render_node)
+                labels.append(f"{e.render_node} · {e.pci} · "
+                              f"{e.label}{tag}")
         else:
             pm = E.prime_index_map()
             gpus = [e for e in engines if e.render_node]

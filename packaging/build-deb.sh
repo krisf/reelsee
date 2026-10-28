@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# P10: build buildout/reelsee_0.2.0_all.deb (§5.5 tree).  No network, no
+# P10: build buildout/reelsee_0.2.2_all.deb (§5.5 tree).  No network, no
 # root: staging tree + `dpkg-deb --build --root-owner-group`.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VER=0.2.0
+VER=0.2.2
 OUT=buildout
 STAGE=$OUT/stage
 

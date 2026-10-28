@@ -18,7 +18,9 @@ Checks (SMOKE_CHECK lines, exit 0 only if all pass):
   libmpv_path/kind    which candidate the installed code chose
   pkg_window_open     one window exists
   pkg_render_ready    video visible: xwd crop mean>8 + time-pos>0
-  pkg_frames_moving   time-pos advanced between samples (frames rendered)
+  pkg_frames_moving   time-pos advanced between samples (frames rendered),
+                      or wrapped at the clip end while playing with
+                      loop-file armed (R15-B: the default is repeat ON)
   pkg_file_loaded     (--open-only) observed mpv 'filename' == target's
                       basename, within PKG_OPEN_TIMEOUT seconds
 Exit codes: 0 pass · 1 check failure · 2 reelsee.run() returned 2 (no
@@ -123,8 +125,20 @@ def main() -> int:
     def step2(app):
         win = state.get("win")
         t1 = state.get("t1", -1.0)
-        t2 = float(win.core.snapshot.get("time-pos") or -1) if win else -1.0
-        check("pkg_frames_moving", t1 > 0 and t2 > t1, f"{t1:.2f}->{t2:.2f}")
+        snap = win.core.snapshot if win else {}
+        t2 = float(snap.get("time-pos") or -1) if win else -1.0
+        # R15-B premise update (own commit): the packaged app ships with
+        # repeat ON (fresh-install loop_file="inf"), so a 1.5 s sample
+        # pair can straddle the end of the short fixture — time-pos
+        # WRAPPING is playback PROOF, not a stall.  Motion must still be
+        # demonstrated honestly: strictly forward, or a wrap with the
+        # player actually playing AND loop-file armed (the only
+        # mechanism that can put t2 under t1 here).
+        playing = snap.get("pause") is False
+        looping = str(snap.get("loop-file")) not in ("no", "None", "")
+        wrapped = t2 >= 0 and t2 < t1 and playing and looping
+        check("pkg_frames_moving", t1 > 0 and (t2 > t1 or wrapped),
+              f"{t1:.2f}->{t2:.2f} wrapped={wrapped}")
         app.quit()
         return False
 

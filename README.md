@@ -187,8 +187,8 @@ player itself never spawns mpv).
 ## Build & install
 
 ```
-packaging/build-deb.sh            # → buildout/reelsee_0.2.0_all.deb
-sudo apt install ./buildout/reelsee_0.2.0_all.deb
+packaging/build-deb.sh            # → buildout/reelsee_0.2.2_all.deb
+sudo apt install ./buildout/reelsee_0.2.2_all.deb
 ```
 
 The package installs `/usr/bin/reelsee` (a shell wrapper), the Python

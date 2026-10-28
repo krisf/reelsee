@@ -22,6 +22,13 @@ VERSION = 1
 
 DEFAULTS: dict = {
     "version": VERSION,
+    # R15-B: one-time migration ledger — run_migrations() adds the flag
+    # to a RAW config file when it first boots a stored file.  True in
+    # DEFAULTS by design: a FRESH install (no file on disk) has nothing
+    # to migrate, and a Config merged from DEFAULTS must read as
+    # "already migrated".  Not a settings leaf — schema_leaf_keys skips
+    # this section exactly like "version".
+    "migrations": {"repeat_default_on": True},
     "audio": {"muted": True, "volume": 100.0, "focus_mute": True,
               "exclusive": False, "delay_s": 0.0, "device": "auto"},
     "engine": {
@@ -31,16 +38,37 @@ DEFAULTS: dict = {
                                      # fall back — see engine.py mapping)
         "renderer_override": "auto", # auto | DRI_PRIME index (string)
         "cpu_threads": 0,            # 0 = auto
+        # R16-D: how many streams the decode GPU holds at once.  Default 2;
+        # refine it on the real desktop with scripts/bench_multidecode.py
+        # (margin rule: highest N where every stream holds >= 24 fps with no
+        # rising drop trend).  Windows beyond it decode on the CPU.
+        "decode_capacity": 2,
         "watchdog_enabled": True,
         "watchdog_fps_floor_pct": 90,
         "watchdog_drop_ceiling_pct": 3,
         "retry_on_new_file": True,
         "last_fallback": None,       # {from,to,ts,fps_ratio,drop_ratio} (Appendix C)
     },
-    "playback": {"speed": 1.0, "loop_file": "no", "loop_playlist": "no",
+    # R15-B: repeat ships ON ("inf" = loop this file forever); the
+    # one-time run_migrations() migrates pre-0.x stored "no" values.
+    "playback": {"speed": 1.0, "loop_file": "inf", "loop_playlist": "no",
                  "autoplay": True, "resume": True, "resume_min_s": 300,
                  "preload_next": False, "keep_open": True,
                  "pitch": True, "video_off": False, "cover_art": "albumart",
+                 # R16-B: a minimized (unmapped) window stops DECODING video
+                 # (`vid=no`) while nobody can see it — audio keeps playing,
+                 # position keeps advancing, nothing is ever auto-paused.
+                 # Off = the pre-R16 behaviour (keep decoding invisibly).
+                 "suppress_video_when_hidden": True,
+                 # R16-E §E.1/§E.2 (ROUND18 corrected): which render node
+                 # VAAPI decode uses.  "" = AUTO: the INTEGRATED
+                 # (non-discrete) card — the iGPU, display-bearing or not;
+                 # connectors are not part of the mandate — or CPU when no
+                 # card qualifies; automatic selection may never name a
+                 # discrete dGPU.  Any other value PINS that node explicitly
+                 # (escape hatch: it may name a dGPU, because a human chose
+                 # it).
+                 "vaapi_device": "",
                  "ytdlp": True, "ytdlp_timeout": 5.0},
     "ab": {"count": "inf"},
     "ui": {"chrome_timeout_ms": 3000, "osd_ms": 1200, "seek_step_s": 5,
@@ -211,7 +239,8 @@ def schema_leaf_keys(defaults: dict | None = None) -> list[str]:
 
     def walk(prefix: str, d: dict) -> None:
         for k, v in d.items():
-            if k == "version":
+            if k in ("version", "migrations"):
+                # internal bookkeeping sections, never settings leaves
                 continue
             path = f"{prefix}{k}"
             if isinstance(v, dict) and v:
@@ -253,6 +282,42 @@ def save_atomic(path: Path, data: dict) -> None:  # SYNC-FS-OK
         except OSError:
             pass
         raise
+
+
+def run_migrations(path: Path | None = None) -> None:  # SYNC-FS-OK
+    """R15-B: one-time config migrations, run at boot BEFORE Config().
+
+    Repeat shipped with the default loop_file "no" until round 15 made
+    it ON ("inf") — but a STORED value always beats the default, so
+    every existing install would keep repeating "off" forever.  This
+    migration runs exactly once per on-disk config: a raw file without
+    the `migrations.repeat_default_on` flag gets that flag, and a
+    literal stored playback.loop_file of "no" flips to "inf" — nothing
+    else in the file is touched (the RAW dict is edited, not the merged
+    one, and written back with save_atomic: temp + rename).
+
+    Never re-fires: once the flag is there the function returns without
+    reading further, so a user who later turns repeat OFF writes a new
+    "no" BEHIND the flag and it survives every restart.  No file yet
+    (fresh install — DEFAULTS already say "inf") or an unreadable/corrupt
+    file: nothing to migrate, nothing written.  A non-literal value
+    ("3", "all", absent) is left exactly as found.
+    """
+    path = Path(path) if path else config_path()
+    raw = load_raw(path)                       # None: missing OR corrupt
+    if raw is None:
+        return
+    mig = raw.get("migrations")
+    if isinstance(mig, dict) and mig.get("repeat_default_on") is True:
+        return                                 # migrated once — never again
+    if not isinstance(mig, dict):
+        mig = {}
+    pb = raw.get("playback")
+    if isinstance(pb, dict) and pb.get("loop_file") == "no":
+        pb["loop_file"] = "inf"                # the ONE literal we flip
+    mig["repeat_default_on"] = True
+    raw["migrations"] = mig
+    save_atomic(path, raw)
 
 
 class Config:

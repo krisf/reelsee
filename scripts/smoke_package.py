@@ -63,10 +63,29 @@ def _canonical_version():
 
 
 PKG_VERSION = _canonical_version()
-_candidates = sorted(glob.glob(os.path.join("buildout", "reelsee_*_all.deb")),
-                     key=lambda p: os.path.getmtime(p))
-DEB = _candidates[-1] if _candidates else os.path.join(
-    "buildout", f"reelsee_{PKG_VERSION or '0.0.0'}_all.deb")
+
+
+def _resolve_deb() -> str:
+    """The .deb to inspect: the one build-deb.sh just produced.
+
+    Resolved AFTER the build, never at import time.  The old code picked the
+    newest buildout/*.deb when the module was imported, i.e. before
+    packaging/build-deb.sh had run — so the first run after a version bump
+    inspected the PREVIOUS release's .deb (ver=0.2.0 read out of a control
+    file that already said 0.2.1) and control_fields went red.  Preferring
+    the filename that matches the control file's Version also stops a stale
+    .deb left in buildout/ from being mistaken for the package under test.
+    """
+    want = os.path.join("buildout", f"reelsee_{PKG_VERSION or '0.0.0'}_all.deb")
+    cands = glob.glob(os.path.join("buildout", "reelsee_*_all.deb"))
+    if PKG_VERSION is not None and want in cands:
+        return want
+    if cands:
+        return sorted(cands, key=lambda p: os.path.getmtime(p))[-1]
+    return want
+
+
+DEB = _resolve_deb()
 ROOT = os.path.join(SCRATCH, "pkg-root")
 PY = "/usr/bin/python3"
 PROBE = os.path.join(REPO, "scripts", "pkg_launch_probe.py")
@@ -159,12 +178,17 @@ def build_negctl_shim() -> dict:
 
 
 def main() -> int:
+    global DEB
     r = subprocess.run(["bash", "packaging/build-deb.sh"],
                        capture_output=True, text=True)
     check("build_ok", r.returncode == 0,
           (r.stderr or r.stdout).strip().splitlines()[-1:] and
           (r.stderr or r.stdout).strip().splitlines()[-1][:120] or "rc=0")
-    check("deb_exists", os.path.exists(DEB), DEB)
+    # Only now: build-deb.sh has written the .deb this release is supposed
+    # to ship, so this is the file every check below must look at.
+    DEB = _resolve_deb()
+    check("deb_exists", os.path.exists(DEB),
+          f"{DEB} (expected version {PKG_VERSION})")
     if not os.path.exists(DEB):
         finish()
         return 1
