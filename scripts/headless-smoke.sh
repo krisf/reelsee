@@ -43,8 +43,15 @@ export TMPDIR="$here/scratch/xvfb-tmp"
 # per-PID dirs used by smokes that TEST geometry persistence
 # (r9rep-state-*, r10wg-state-*) don't match *-state and are untouched.
 rm -f scratch/smoke/*-state/window.json 2>/dev/null || true
-rm -f "${REELSEE_STATE_DIR:-$HOME/.local/state/reelsee}/window.json" \
-    2>/dev/null || true
+# NEVER fall back to the user's real ~/.local/state/reelsee: a battery run
+# without REELSEE_STATE_DIR used to delete the operator's saved window rect
+# every single invocation (measured 2026-11-04: the live user's position
+# resume appeared broken because a verification battery was purging their
+# real window.json between their launches).  Purge only the dir the caller
+# explicitly opted into.
+if [ -n "${REELSEE_STATE_DIR:-}" ]; then
+    rm -f "$REELSEE_STATE_DIR/window.json" 2>/dev/null || true
+fi
 
 log="scratch/smoke/$name.log"
 start=$SECONDS

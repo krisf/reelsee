@@ -14,9 +14,11 @@ Why raw Xlib at all (operator-proven, references/ROUND10-BRIEF.md):
 So this module is deliberately a *degradation-first* seam: every entry
 point returns None/False and logs ONE debug line when the platform has
 no answer (no surface yet, no xid, non-X11 surface, Xlib missing, X
-server unreachable, dead connection).  It must never raise, never block
-the main loop, and never spam the log — the open path in window.py keeps
-working size-only no matter what happens here.
+server unreachable, dead connection) — EXCEPT the no-xid notice, which is
+INFO since round 24 because it is the one degradation the operator has to
+be able to see.  It must never raise, never block the main loop, and never
+spam the log — the open path in window.py keeps working size-only no
+matter what happens here.
 
 The python-xlib Display connection is opened lazily and shared; window
 coordinates are walked up the parent chain to the ROOT window, so a
@@ -36,7 +38,7 @@ _state: dict = {
     "display_failed": False,
     "xid_probe": None,        # (module, surface-class-name) cache — debug only
 }
-_logged = set()               # one debug line per (kind) — never a per-tick log
+_logged = set()               # one line per (kind) — never a per-tick log
 
 
 def _debug_once(kind: str, msg: str, *args) -> None:
@@ -45,9 +47,19 @@ def _debug_once(kind: str, msg: str, *args) -> None:
         log.debug(msg, *args)
 
 
+def _info_once(kind: str, msg: str, *args) -> None:
+    """Like _debug_once, for the ONE degradation the operator needs to see
+    without turning debug on (R24: the no-xid notice was the only thing in
+    the log explaining why a remembered position was ignored, and it was
+    invisible at the default level)."""
+    if kind not in _logged:
+        _logged.add(kind)
+        log.info(msg, *args)
+
+
 def reset_logging_for_tests() -> None:
-    """Smokes assert 'one debug log, no exception' on the Wayland path;
-    they clear the once-latch first so the assertion is about THIS run."""
+    """Smokes assert 'one log line, no exception' on the Wayland path; they
+    clear the once-latch first so the assertion is about THIS run."""
     _logged.clear()
 
 
@@ -67,9 +79,14 @@ def surface_xid(win) -> int | None:
         return None
     get_xid = getattr(surf, "get_xid", None)
     if get_xid is None:                             # Wayland surfaces lack it
-        _debug_once("no-xid", "surface %s has no xid: positioning is "
-                    "X11-only; size-only from here (compositor owns "
-                    "position)", type(surf).__name__)
+        # R24: INFO, not DEBUG.  This is the line that explains to the
+        # operator why a remembered position was ignored, and it was
+        # invisible at the default level — which is exactly how "it still
+        # does not resume position" survived a release.  Still ONE line per
+        # process (the once-latch), so a 1 s sampler cannot spam the log.
+        _info_once("no-xid", "surface %s has no xid: positioning is "
+                   "X11-only; size-only from here (compositor owns "
+                   "position)", type(surf).__name__)
         return None
     try:
         with warnings.catch_warnings():             # get_xid is deprecated
@@ -208,15 +225,127 @@ def _drop_display() -> None:
 # array of 18 CARD32 words:
 #   [0]flags [1]x [2]y [3]w [4]h [5..8]min/max w,h [9,10]resize inc
 #   [11,12]min aspect num,den [13,14]max aspect num,den [15,16]base w,h
-#   [17]win_gravity.   PAspect is bit 5 of the flags.
+#   [17]win_gravity.
+# R28 — the round this whole seam was DEAD on a real desktop: the flag bit
+# table below had PAspect at `1 << 5`.  ICCCM §4.1.2.4 (and <X11/Xutil.h>):
+# USPosition 1, USSize 2, PPosition 4, PSize 8, PMinSize 16, PMaxSize 32,
+# PResizeInc 64, PAspect 128, PBaseSize 256, PWinGravity 512.  `1 << 5` is
+# PMaxSize; PAspect is 1 << 7.  Measured on the operator's Mutter: the old
+# bit advertised PMaxSize over max words that are 0,0 — a WM reads "never
+# larger than 0x0" and clamps the window to its content minimum (102x102
+# window.json = the user's "missing window"), while clear_aspect_ratio
+# stripped GDK's own PMaxSize flag.  The table is now spelled OUT word by
+# word and audited against Xutil.h; the arithmetic lives in the PURE
+# hints_merge_aspect/hints_clear_aspect functions below (unit-gated with no
+# display by tests/test_x11pos_hints.py), and NOTHING publishes without
+# (b) dropping a PMaxSize whose max words are 0,0 and (c) skipping a write
+# whose array would be byte-identical to the server's.
 # Everything is raw protocol constants (no Xlib imports at module scope —
 # the module must stay importable with no Xlib and no display).
 _HINTS_WORDS = 18
 _SH_FLAGS = 0
+_SH_X, _SH_Y, _SH_W, _SH_H = 1, 2, 3, 4
+_SH_MIN_W, _SH_MIN_H = 5, 6
+_SH_MAX_W, _SH_MAX_H = 7, 8
+_SH_WINC, _SH_HINC = 9, 10
 _SH_MIN_ASPECT = 11
 _SH_MAX_ASPECT = 13
-_PASPECT = 1 << 5
+_SH_BASE_W, _SH_BASE_H = 15, 16
+_SH_GRAVITY = 17
+# ICCCM §4.1.2.4 / <X11/Xutil.h> WM_SIZE_HINTS flag bits — R28-corrected.
+_US_POSITION = 1 << 0        #   1
+_US_SIZE = 1 << 1            #   2
+_PPOSITION = 1 << 2          #   4
+_PSIZE = 1 << 3              #   8
+_PMIN_SIZE = 1 << 4          #  16
+_PMAX_SIZE = 1 << 5          #  32  <- NOT PAspect.  This mix-up is R28.
+_PRESIZE_INC = 1 << 6        #  64
+_PASPECT = 1 << 7            # 128  <- the aspect-ratio flag (R28 fix)
+_PBASE_SIZE = 1 << 8         # 256
+_PWIN_GRAVITY = 1 << 9       # 512
 _PROP_MODE_REPLACE = 0
+
+
+# --------------------------------------------------- pure hints arithmetic
+# R28 §4: every decision about the array's WORDS is a pure function here —
+# no X calls, no display — so tests/test_x11pos_hints.py can audit the
+# bit arithmetic headless, including the negative control (the pre-R28
+# constants fail that gate by construction).
+
+
+def _hints_pad(arr) -> list[int] | None:
+    """Anything shaped like the hints array → exactly 18 masked ints, or
+    None for garbage (non-numeric words).  Short arrays are the ancient
+    14-word form, zero-padded like _read_hints does; longer input is a
+    sign of a broken caller and is refused."""
+    try:
+        vals = [int(v) & 0xFFFFFFFF for v in arr]
+    except (TypeError, ValueError):
+        return None
+    if len(vals) > _HINTS_WORDS:
+        return None
+    if len(vals) < _HINTS_WORDS:
+        vals += [0] * (_HINTS_WORDS - len(vals))
+    return vals
+
+
+def _hints_drop_dead_max(arr: list[int]) -> bool:
+    """In-place R28 §3-B: a PMaxSize whose max_width AND max_height are 0
+    is self-defeating — ICCCM treats an unset flag as "no maximum", while
+    a SET flag with zero words means "never larger than 0x0", and a real
+    WM answers that by clamping the window to its content minimum.  Drop
+    the FLAG (the words are inert once the flag is gone, so foreign word
+    bytes stay untouched).  Returns True when it changed anything.
+    PMaxSize with any nonzero max word is a legitimate client maximum and
+    is NEVER touched here."""
+    if (arr[_SH_FLAGS] & _PMAX_SIZE
+            and arr[_SH_MAX_W] == 0 and arr[_SH_MAX_H] == 0):
+        arr[_SH_FLAGS] &= ~_PMAX_SIZE & 0xFFFFFFFF
+        return True
+    return False
+
+
+def hints_merge_aspect(arr, num, den) -> list[int] | None:
+    """Pure half of set_aspect_ratio: `arr` (the server's current words)
+    with PAspect ``num:den`` pinned (min-aspect == max-aspect) — a NEW
+    list, or None when the server ALREADY holds exactly that, i.e. the
+    caller must write NOTHING (R28 §3-C: no property announcement, no WM
+    round-trip, per drawn frame).  Foreign words (GDK's min/base/inc/
+    gravity) survive byte-exactly; a dead PMaxSize-0,0 flag is dropped
+    (§3-B).  Garbage input (non-numeric, > 18 words, bad ratio) → None."""
+    try:
+        num, den = int(num), int(den)
+    except (TypeError, ValueError):
+        return None
+    if num <= 0 or den <= 0:
+        return None
+    out = _hints_pad(arr)
+    if out is None:
+        return None
+    before = list(out)
+    out[_SH_FLAGS] |= _PASPECT
+    out[_SH_MIN_ASPECT], out[_SH_MIN_ASPECT + 1] = num, den
+    out[_SH_MAX_ASPECT], out[_SH_MAX_ASPECT + 1] = num, den
+    _hints_drop_dead_max(out)
+    return out if out != before else None
+
+
+def hints_clear_aspect(arr) -> list[int] | None:
+    """Pure half of clear_aspect_ratio: clear the PAspect BIT ONLY —
+    never PMaxSize (R28 §3-A: the old constant cleared PMaxSize and had
+    been stripping GDK's own maximum), never any other foreign word; the
+    aspect words themselves are inert without the flag and stay put — or
+    None when the server already has the bit clear, i.e. write nothing.
+    The one exception is the §3-B dead-max drop: a PMaxSize-0,0 left by
+    the PRE-R28 code still poisons the window, so clearing the lock must
+    heal it too.  Garbage input → None."""
+    out = _hints_pad(arr)
+    if out is None:
+        return None
+    before = list(out)
+    out[_SH_FLAGS] &= ~_PASPECT & 0xFFFFFFFF
+    _hints_drop_dead_max(out)
+    return out if out != before else None
 
 
 def _read_hints(xw, disp) -> list[int] | None:
@@ -254,12 +383,19 @@ def set_aspect_ratio(win, num, den) -> bool:
     """Publish PAspect ``num:den`` in WM_NORMAL_HINTS — MERGE-WRITE.
 
     The window's other fields (GDK's own min-size/base-size/gravity words
-    live in the SAME property) are read back first and written untouched;
-    only flags |= PAspect and the four aspect words change.  min-aspect ==
-    max-aspect pins the ratio exactly.  True = the property is now on the
-    server (sync() proves it); False = degraded (no xid/Xlib/dead server)
-    and the caller keeps the §R8-B post-hoc correction path.  Never raises.
-    """
+    live in the SAME property) are read back first and handed to the pure
+    `hints_merge_aspect`, which returns None when the server ALREADY
+    holds exactly the array we want — then NOTHING is written (R28 §3-C:
+    the clobber watch answers GDK's per-frame PropertyNotify by re-
+    applying, and every identical re-write was another property
+    announcement, another WM round-trip, and another re-constrain of the
+    live window on a real WM).  A write that DOES happen has already had
+    any dead PMaxSize-0,0 flag dropped (§3-B), so a self-defeating array
+    can never leave this function.  min-aspect == max-aspect pins the
+    ratio exactly.  True = the property is now on the server (sync()
+    proves it, or proves it was already right); False = degraded (no
+    xid/Xlib/dead server) and the caller keeps the §R8-B post-hoc
+    correction path.  Never raises."""
     try:
         num, den = int(num), int(den)
     except (TypeError, ValueError):
@@ -273,14 +409,10 @@ def set_aspect_ratio(win, num, den) -> bool:
     arr = _read_hints(xw, disp)
     if arr is None:
         arr = [0] * _HINTS_WORDS
-    if (arr[_SH_FLAGS] & _PASPECT
-            and arr[_SH_MIN_ASPECT] == num and arr[_SH_MIN_ASPECT + 1] == den
-            and arr[_SH_MAX_ASPECT] == num and arr[_SH_MAX_ASPECT + 1] == den):
-        return True                                 # already exactly right
-    arr[_SH_FLAGS] |= _PASPECT
-    arr[_SH_MIN_ASPECT], arr[_SH_MIN_ASPECT + 1] = num, den
-    arr[_SH_MAX_ASPECT], arr[_SH_MAX_ASPECT + 1] = num, den
-    return _write_hints(xw, disp, arr)
+    merged = hints_merge_aspect(arr, num, den)
+    if merged is None:
+        return True          # the server already holds exactly this array
+    return _write_hints(xw, disp, merged)
 
 
 def clear_aspect_ratio(win) -> bool:
@@ -288,16 +420,22 @@ def clear_aspect_ratio(win) -> bool:
     no video, fullscreen).  A missing property, or one without the bit, is
     ALREADY clear: return True without touching the server (no property
     churn on every state ping).  Merge-write, so GDK's other fields live
-    on untouched."""
+    on untouched — and "untouched" now means the RIGHT bit: the pre-R28
+    constant cleared PMaxSize (32) instead of PAspect (128), i.e. this
+    call had been silently stripping GDK's own maximum-size flag since
+    the seam shipped.  A dead PMaxSize-0,0 (left by that old code) is the
+    one thing healed here, per §3-B."""
     got = _window(win)
     if got is None:
         return False
     disp, xw = got
     arr = _read_hints(xw, disp)
-    if arr is None or not (arr[_SH_FLAGS] & _PASPECT):
-        return True
-    arr[_SH_FLAGS] &= ~_PASPECT & 0xFFFFFFFF
-    return _write_hints(xw, disp, arr)
+    if arr is None:
+        return True                     # no property: already clear
+    cleared = hints_clear_aspect(arr)
+    if cleared is None:
+        return True                     # bit already clear: write nothing
+    return _write_hints(xw, disp, cleared)
 
 
 def get_aspect_ratio(win) -> tuple[int, int] | None:

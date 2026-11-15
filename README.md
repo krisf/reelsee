@@ -67,7 +67,7 @@ bracketed column tells where it lives.
 | Quality | scale presets (default/fast/high/higher → `scale/cscale/dscale`), deband, dither depth, interpolation, tscale | settings → Video |
 | Deinterlace | auto / yes / no | settings → Video |
 | Screenshots | png/jpg + directory + quality; optional clipboard copy | `s`, settings → Interface |
-| Window | chrome is a **zero-space overlay** — the video owns the whole client area and the bars float over it, so revealing them never resizes the picture; fullscreen (F11), leave-Fullscreen (Esc), always-on-top, custom title format (`${media-title}` / `${filename}`); last window size & position remembered across launches (`ui.remember_geometry`, never a fullscreen rect); new windows cascade beside the current one at its exact size (`ui.cascade_offset_px`, flips at the screen edge, 0 = exactly on top) — positioning is an X11 capability, so on Wayland the packaged `.desktop` pins `GDK_BACKEND=x11` (environment-overridable) and native Wayland degrades to size-only cascades | `f`, Esc, settings → Interface |
+| Window | chrome is a **zero-space overlay** — the video owns the whole client area and the bars float over it, so revealing them never resizes the picture; fullscreen (F11), leave-Fullscreen (Esc), always-on-top, custom title format (`${media-title}` / `${filename}`); last window size & position remembered across launches (`ui.remember_geometry`, never a fullscreen rect); new windows step toward the screen centre at the exact size (`ui.cascade_offset_px`, 0 = exactly on top), and a window reopens at the exact coords+dims it closed at unless at least 2 of its corners are off the screen — positioning is an X11 capability, so on Wayland the packaged `.desktop` pins `GDK_BACKEND=x11` (environment-overridable) and native Wayland degrades to size-only cascades | `f`, Esc, settings → Interface |
 | Resume | resume position per file in **our** `resume.json` (never mpv's `--resume-playback`) | automatic (`playback.resume`, `resume_min_s`) |
 | Decode | hardware decode + GPU pin + CPU decode + overload watchdog (auto drop to `hwdec=no`) | settings → Advanced; auto round-robin across GPUs |
 | Playlist | add file/folder, remove, reorder, shuffle, save/load `.m3u`, next/prev, natural sort, folder live-refresh | right-click → Playlist, `n` / `b` |
@@ -187,8 +187,8 @@ player itself never spawns mpv).
 ## Build & install
 
 ```
-packaging/build-deb.sh            # → buildout/reelsee_0.2.2_all.deb
-sudo apt install ./buildout/reelsee_0.2.2_all.deb
+packaging/build-deb.sh            # → buildout/reelsee_0.2.12_all.deb
+sudo apt install ./buildout/reelsee_0.2.12_all.deb
 ```
 
 The package installs `/usr/bin/reelsee` (a shell wrapper), the Python

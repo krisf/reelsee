@@ -12,6 +12,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 OUT="${1:-../reelsee-public}"
 
 command -v git >/dev/null || { echo "git required" >&2; exit 2; }
+SRC="$(pwd)"   # the SOURCE repo — the ignored leak-pattern file lives here,
+               # never in the minted tree, so the sweep must read SRC.
 rm -rf "$OUT"; mkdir -p "$OUT"
 git archive HEAD | tar -x -C "$OUT"
 cd "$OUT"
@@ -50,14 +52,16 @@ fail=0
 # supposed to carry. Site-specific names and addresses live in the ignored
 # pattern file, where they can be specific without being published.
 PATTERNS='^(/|[.]|[a-z]+:)?/?home/[a-z]+/|192\.168\.|TODO-SET-UPSTREAM'
-if [ -f scripts/leak-patterns.txt ]; then
+if [ -f "$SRC/scripts/leak-patterns.txt" ]; then
   while IFS= read -r pat; do
     [ -n "$pat" ] || continue
     case "$pat" in \#*) continue ;; esac
     if grep -rInE --exclude=make_public.sh "$pat" . >/dev/null 2>&1; then
       echo "ERROR: minted tree matches a private pattern ($pat)" >&2; fail=1
     fi
-  done < scripts/leak-patterns.txt
+  done < "$SRC/scripts/leak-patterns.txt"
+else
+  echo "NOTE: $SRC/scripts/leak-patterns.txt absent — personal sweep skipped" >&2
 fi
 if grep -rInE --exclude=make_public.sh "$PATTERNS" . >/dev/null 2>&1; then
   echo "ERROR: a private path, private network or unset placeholder is present" >&2
@@ -66,7 +70,7 @@ fi
 # A gate that hard-codes an old version tests a package that no longer exists.
 VER="$(sed -n 's/^Version: *//p' packaging/DEBIAN/control 2>/dev/null | head -1)"
 if [ -n "$VER" ]; then
-  if grep -rInE --exclude=make_public.sh 'reelsee_[0-9]+\.[0-9]+[._0-9]*_all[.]deb' . 2>/dev/null |
+  if grep -rInE --exclude=make_public.sh --exclude=DESIGN.md 'reelsee_[0-9]+\.[0-9]+[._0-9]*_all[.]deb' . 2>/dev/null |\
      grep -v "reelsee_${VER}_all[.]deb" | grep -q .; then
     echo "ERROR: a .deb filename is pinned to something other than $VER" >&2; fail=1
   fi

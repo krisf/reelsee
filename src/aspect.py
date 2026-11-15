@@ -281,3 +281,35 @@ def paspect_pair(dwidth, dheight, max_den: int = PASPECT_MAX_DEN,
     if best is not None:
         return best
     return (wi, hi)                            # exact wins over tidy
+
+
+# ------------------------------------------------------- R28 publish gate
+def hint_consistent(w, h, num, den, rel: float = MISMATCH_REL) -> bool:
+    """May a ``num:den`` PAspect be published onto a window that IS ``(w, h)``?
+
+    R28 (measured on the operator's Mutter, scratch/diag/r28-diag4.log):
+    writing min==max PAspect words onto a window whose current size
+    VIOLATES them makes a real WM resize that window the same instant —
+    1200x900 (4:3) clamped to 1266x792 within ONE millisecond of the
+    property landing, with no app-side resize anywhere in the log.  The
+    app then fights that answer (R21 settle re-asserts its target), and on
+    the operator's rig the walk ended at 54x54, persisted, "missing
+    window".  A declaration is therefore only safe while the live size
+    agrees with it.
+
+    "Agrees" means exactly on the ratio (``w*den == h*num``), or within the
+    §R8-B.4 tolerance ``rel`` — a size the post-hoc correction itself
+    produces (rounding a 16:9 fit to integer pixels) misses the exact
+    ratio by a pixel or less and clamps, at worst, by a pixel or less, so
+    it stays publishable; the 4:3-vs-16:9 seed misses by 25 % and must
+    NEVER be published: refuse, and no window system has anything to clamp.
+    """
+    wi, hi = _num(w), _num(h)
+    if wi is None or hi is None or wi <= 0 or hi <= 0:
+        return False
+    n, d = _num(num), _num(den)
+    if n is None or d is None or n <= 0 or d <= 0:
+        return False
+    if wi * d == hi * n:
+        return True
+    return abs(wi / hi - n / d) / (n / d) <= rel

@@ -199,6 +199,10 @@ class CaptureStub:
     _geom_live_rect = ReelseeWindow._geom_live_rect
     _geom_enabled = ReelseeWindow._geom_enabled
     _geom_monitor_index = ReelseeWindow._geom_monitor_index
+    # R24 §C.2: capture_geometry now asks this for the index to store, so
+    # the stub has to carry it (harness mirror of the real class, no
+    # assertion changed).
+    _geom_store_monitor = ReelseeWindow._geom_store_monitor
     capture_geometry = ReelseeWindow.capture_geometry
 
     def __init__(self, store, rect, fs=False):
@@ -269,5 +273,7 @@ class WindowCapture(unittest.TestCase):
 
     def test_plan_persistence_settings_keys(self):
         # the two R10 keys exist in DEFAULTS with the specified defaults
+        # (R20 §A2 lowered the cascade default 50 → 15: the cascade is now
+        # centerward, so a smaller step is the right default)
         self.assertTrue(config.DEFAULTS["ui"]["remember_geometry"])
-        self.assertEqual(config.DEFAULTS["ui"]["cascade_offset_px"], 50)
+        self.assertEqual(config.DEFAULTS["ui"]["cascade_offset_px"], 15)

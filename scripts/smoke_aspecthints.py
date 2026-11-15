@@ -32,7 +32,8 @@ python-xlib — the same bytes a real WM would read — and asserts:
     window on the video's shape — and nothing re-publishes behind it.
 
 Checks: paspect_absent_idle, dwidth_wide_observed, paspect_wide_16_9,
-paspect_wide_pinned, paspect_small_ints, paspect_1px_at_size,
+paspect_wide_pinned, paspect_small_ints, paspect_no_dead_max (R28),
+paspect_1px_at_size,
 dwidth_vert_observed, paspect_vert_9_16, paspect_cleared_lock_off,
 paspect_restored_lock_on, paspect_cleared_crop_on,
 paspect_restored_crop_off, paspect_cleared_fullscreen,
@@ -74,7 +75,15 @@ VERT = SCRATCH / "vertical_270x480.mp4"      # 9:16 of the brief, generated
 # src/x11pos.py; duplicated ON PURPOSE so the gate never inherits a bug in
 # the parser it is supposed to be auditing.
 _F_FLAGS, _F_MINASP, _F_MAXASP = 0, 11, 13
-_PASPECT = 1 << 5
+# R28: this gate's OWN copy of the bit was `1 << 5` — which is ICCCM
+# PMaxSize, not PAspect (PAspect is 1 << 7 == 128).  A gate that audits
+# the wrong bit audits the bug, not the fix: it stayed green while the
+# seam it certifies was dead on a real WM (ROUND28-BRIEF §1).  Corrected
+# value plus a new audit that a published array never carries PMaxSize
+# over max words 0,0 — the self-defeating pair that collapsed the
+# operator's window to 102x102.
+_PASPECT = 1 << 7
+_PMAX_SIZE = 1 << 5
 
 state: dict = {}
 
@@ -326,6 +335,13 @@ def sched(app):
         check("paspect_wide_pinned", p[0:2] == p[2:4], f"words={p}")
         check("paspect_small_ints",
               all(v <= aspect.PASPECT_MAX_DEN for v in p), f"words={p}")
+        # R28: no self-defeating array may reach the SERVER — PMaxSize set
+        # with max words 0,0 is what Mutter answered with a content-minimum
+        # clamp (the missing window).  Audited here at the widest moment.
+        arr = hints_now() or []
+        dead = bool(arr) and (arr[_F_FLAGS] & _PMAX_SIZE) \
+            and len(arr) > 8 and arr[7] == 0 and arr[8] == 0
+        check("paspect_no_dead_max", not dead, f"flags={arr[:1]!r} max={arr[7:9]!r}")
         # the 1 px contract AT THE CURRENT SIZE: pair vs the video's true
         # ratio, expressed in pixels of the window's live height.
         gw, gh = wgeom()

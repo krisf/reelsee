@@ -296,6 +296,22 @@ def base_schedule(app, phase):
         check("p2_born_looping", str(s.get("loop-file")) == "inf"
               and str(s.get("loop-playlist")) == "no",
               repr((s.get("loop-file"), s.get("loop-playlist"))))
+        # Poll for the paints instead of sampling them at a fixed 400 ms.
+        # The battery 2026-11-05 failed p2_no_off_paint with ['one']: on a
+        # loaded box only ONE of the two startup repaints had landed inside
+        # the sample window, so the gate measured its own timing rather than
+        # the product.  The assertion itself is unchanged and stays in
+        # p2_painted, where it can still print the modes it saw.
+        return again(guard(lambda: wait_for(
+            "p2_paints_settled", p2_paints_settled, guard(p2_painted))), 100)
+
+    def p2_paints_settled():
+        """True once the paint path has run twice — or immediately if a wrong
+        mode is painted, so the failure is reported fast and with the list."""
+        modes = state["paint_modes"]
+        return len(modes) >= 2 or "off" in modes
+
+    def p2_painted():
         modes = state["paint_modes"]
         check("p2_no_off_paint", "off" not in modes and len(modes) >= 2,
               repr(modes[-4:]))
@@ -427,6 +443,13 @@ def base_schedule(app, phase):
         check("p3_born_off", str(s.get("loop-file")) == "no"
               and str(s.get("loop-playlist")) == "no",
               repr((s.get("loop-file"), s.get("loop-playlist"))))
+        # Same fixed-sample race as phase 2: an empty list here would fail
+        # p3_paints_off for a reason that has nothing to do with the product.
+        return again(guard(lambda: wait_for(
+            "p3_paints_started", lambda: bool(state["paint_modes"]),
+            guard(p3_painted))), 100)
+
+    def p3_painted():
         modes = state["paint_modes"]
         check("p3_paints_off", modes and all(m == "off" for m in modes),
               repr(modes[-4:]))

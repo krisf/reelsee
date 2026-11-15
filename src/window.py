@@ -41,6 +41,22 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 log = logging.getLogger("reelsee.window")
 
 
+# ------------------------------------------------- R26 resume tail rule
+#: How long the tail rule waits for ``duration`` to reach the OBSERVED
+#: snapshot before giving up and doing what file-loaded always did.
+#: ``duration`` is in ``OBSERVED_BASE`` (``mpvcore.py:25``), so it lands on
+#: the mpv event thread and can arrive AFTER the ``file-loaded`` callback
+#: that starts the restore — a synchronous getter is forbidden (R9,
+#: ``tests/test_no_blocking_mpv.py``), so the decision is deferred on the
+#: same bounded-countdown idiom as ``_aspect_on_file``.
+RESUME_TAIL_POLL_MS = 150
+RESUME_TAIL_TRIES = 13                  # 13 x 150 ms ≈ 2.0 s of waiting
+#: ``playback.resume_tail_frac`` default, and the clamp: a bad value must
+#: never make every video restart from 0.
+RESUME_TAIL_FRAC_DEFAULT = 0.10
+RESUME_TAIL_FRAC_MAX = 0.5
+
+
 # ---------------------------------------------------------------- R14-A menu
 # GTK's own CSD titlebar gesture path ends at
 # `Gdk.Toplevel.show_window_menu` (on X11 it sends _GTK_SHOW_WINDOW_MENU and
@@ -313,6 +329,45 @@ WINDOW_EXTRA_OBSERVED = {
 START_SIZE = (960, 540)
 
 
+# ------------------------------------------------- R21 position-settle budget
+# Measured facts behind this loop (references/ROUND21-BRIEF.md §0, operator
+# on the live Mutter/XWayland desktop): a new window is PLACED BY THE
+# COMPOSITOR (created at (500,400) → landed (2476,1418)); PPosition/
+# USPosition in WM_NORMAL_HINTS set BEFORE map are IGNORED; only a
+# client-initiated move AFTER map moves the window — and a single such move
+# can land while the compositor is still finishing its own placement, so it
+# is silently lost.  That is "video players always open centred".  The post-
+# map move is therefore the only lever, and it must be RE-ASSERTED until the
+# window is OBSERVED at the target, not fired once and hoped for.
+#
+# The budget is deliberately small and the logging deliberately quiet: a
+# fight the WM is losing has to end in ~2 s with ONE debug line — x11pos is
+# a degradation-first seam and must never spam the log or block the loop.
+GEOM_SETTLE_ATTEMPTS = 8              # §1: up to 8 moves
+GEOM_SETTLE_INTERVAL_MS = 150         # §1: re-issued ~150 ms apart
+GEOM_SETTLE_BUDGET_S = 2.0            # §1: ~2 s total wall time
+GEOM_SETTLE_POS_TOL = 4               # px: a WM's own rounding / frame extents
+GEOM_SETTLE_SIZE_TOL = 2              # px: GTK's own resize echo
+
+
+def _rect_close(a, b, pos_tol=GEOM_SETTLE_POS_TOL,
+                size_tol=GEOM_SETTLE_SIZE_TOL) -> bool:
+    """True when two (x, y, w, h) rects agree within the settle tolerance.
+
+    None or garbage on either side is NOT a match: "we could not observe
+    the window" must never be read as "the window is where we put it"
+    (that misreading is exactly how a lost move becomes a false success)."""
+    if a is None or b is None:
+        return False
+    try:
+        ax, ay, aw, ah = (int(v) for v in tuple(a)[:4])
+        bx, by, bw, bh = (int(v) for v in tuple(b)[:4])
+    except (TypeError, ValueError, IndexError):
+        return False
+    return (abs(ax - bx) <= pos_tol and abs(ay - by) <= pos_tol
+            and abs(aw - bw) <= size_tol and abs(ah - bh) <= size_tol)
+
+
 def _abs_entry(u):
     """m3u entries must survive the playlist being saved anywhere: mpv
     resolves relative paths against the m3u file's directory (§P11)."""
@@ -379,6 +434,10 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         self._resolve_t0 = 0.0                # smoke measurement stamp
         self._resume_id = None
         self._resume_last = -10.0
+        # R26: id of the ONE deferred tail-rule attempt for the current load
+        # (None = no decision pending).  Cancelled by a second file load, a
+        # second _resume_restore() call and by window teardown.
+        self._resume_pending_id = None
         self._pl_sig = None
         self._ch_sig = None
         self._chapter_idx = None
@@ -644,6 +703,13 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         self._geom_id = None              # 1 s move/size sampler
         self._geom_timer = None           # debounced persist (~250 ms)
         self._geom_guard_id = None        # placement-echo guard release
+        # R21: the open-placement SETTLE LOOP.  None when idle, else the
+        # live loop state (target, last observed rect, attempts left, wall
+        # deadline, timer).  The counters are honest and introspectable —
+        # tests and scripts/smoke_wingeom.py read them instead of guessing.
+        self._geom_settle = None
+        self._geom_settle_moves = 0       # moves issued by settle loops
+        self._geom_settle_reason = None   # last loop's outcome
 
         self.set_default_size(*START_SIZE)
         self._update_title()
@@ -685,7 +751,8 @@ class ReelseeWindow(Gtk.ApplicationWindow):
             drop_ceiling_pct=float(
                 self.cfg.get("engine.watchdog_drop_ceiling_pct", 3)))
         self._wd_sampler = WD.Sampler(
-            self.core, simulate=getattr(app, "simulate_overload", False))
+            self.core, simulate=getattr(app, "simulate_overload", False),
+            presentable=self._wd_presentable)
         self.watchdog.file_loaded()          # startup grace from t=0
         self._wd_id = GLib.timeout_add(1000, self._watchdog_tick)
         # R2-P2/I1: engagement watcher armed per file in _arm_engine_watch().
@@ -1895,7 +1962,18 @@ class ReelseeWindow(Gtk.ApplicationWindow):
             log.exception("resume capture failed (shutdown)")
 
     def _resume_restore(self) -> None:
-        """§7 T1: jump back to resume.json position after a file loads."""
+        """§7 T1: jump back to resume.json position after a file loads.
+
+        R26: a remembered position inside the last ``playback.resume_tail_frac``
+        (default 10 %) of the runtime is NOT restored — the file plays from 0
+        and the stale entry is dropped.  The rule runs AFTER the unchanged
+        ``playback.resume_min_s`` gate and BEFORE the seek, and it needs the
+        duration, which only exists in the OBSERVED snapshot (R9) and can
+        arrive after this ``file-loaded`` callback — so the decision is
+        deferred on a bounded retry instead of guessed (see
+        ``_resume_attempt``).  Nothing else about resume changed.
+        """
+        self._resume_cancel_pending()     # one decision per load, never two
         if not self.target or not bool(self.cfg.get("playback.resume", True)):
             return
         entry = self.app.resume_store.get(str(self.target)) or {}
@@ -1905,9 +1983,75 @@ class ReelseeWindow(Gtk.ApplicationWindow):
             return
         if pos < float(self.cfg.get("playback.resume_min_s", 300)):
             return
+        self._resume_attempt(pos, RESUME_TAIL_TRIES)
+
+    def _resume_attempt(self, pos: float, left: int) -> bool:
+        """R26: decide the restore with whatever duration the snapshot has
+        NOW; re-arm on the observed snapshot while the duration is unknown.
+
+        Mirrors ``_aspect_on_file``'s bounded countdown: ``GLib.timeout_add``
+        with a countdown argument, never a synchronous mpv getter.  When the
+        budget runs out with the duration still unknown the OLD behaviour
+        stands (seek), so this round can never make resume worse for files
+        mpv reports no duration for.  Returns False: one-shot either way.
+        """
+        self._resume_pending_id = None
+        if self._closing:                 # never seek into a dead window
+            return False
+        raw = self.core.snapshot.get("duration")
+        try:
+            dur = float(raw) if raw else 0.0
+        except (TypeError, ValueError):
+            dur = 0.0
+        if dur > 0:
+            frac = self._resume_tail_frac()
+            if dur - pos < frac * dur:
+                # Strictly less than: exactly `frac` remaining still seeks.
+                # A corrupt entry (dur < pos) lands here too.
+                self.app.resume_store.remove(str(self.target), persist=False)
+                log.info("resume tail: pos=%.1f dur=%.1f frac=%.2f "
+                         "(%.1f s left < %.1f s) — playing from 0",
+                         pos, dur, frac, dur - pos, frac * dur)
+                return False
+            self._resume_seek(pos)
+            return False
+        if left <= 0:
+            log.info("resume: duration still unknown after %d x %d ms — "
+                     "keeping today's behaviour (seek to pos=%.1f)",
+                     RESUME_TAIL_TRIES, RESUME_TAIL_POLL_MS, pos)
+            self._resume_seek(pos)
+            return False
+        self._resume_pending_id = GLib.timeout_add(
+            RESUME_TAIL_POLL_MS, self._resume_attempt, pos, left - 1)
+        return False
+
+    def _resume_seek(self, pos: float) -> None:
+        """The unchanged restore: seek + toast (R26: split out so the
+        deferred path and the immediate path cannot drift apart)."""
         self._resume_last = pos
         self.core.command("seek", str(pos), "absolute")
         self.chrome.show_toast(f"Resumed at {chrome.fmt_time(pos)}")
+
+    def _resume_tail_frac(self) -> float:
+        """R26: ``playback.resume_tail_frac``, clamped to [0, 0.5] and read
+        live like its neighbours; a bad value must never make every video
+        restart, so it falls back to the default rather than to 0.5."""
+        try:
+            frac = float(self.cfg.get("playback.resume_tail_frac",
+                                      RESUME_TAIL_FRAC_DEFAULT))
+        except (TypeError, ValueError):
+            frac = RESUME_TAIL_FRAC_DEFAULT
+        if not math.isfinite(frac):
+            frac = RESUME_TAIL_FRAC_DEFAULT
+        return min(max(frac, 0.0), RESUME_TAIL_FRAC_MAX)
+
+    def _resume_cancel_pending(self) -> None:
+        """R26: drop a pending tail-rule attempt — a second file load, a
+        second ``_resume_restore()`` call or window teardown must never let
+        an old decision seek into a new file (or a closed window)."""
+        if self._resume_pending_id is not None:
+            GLib.source_remove(self._resume_pending_id)
+            self._resume_pending_id = None
 
     def _update_title(self) -> None:
         snap = self.core.snapshot
@@ -1996,6 +2140,22 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         # noticed.  Transition-only: no mpv write until the state flips.
         self._sync_hidden_suppression("pump")
 
+    def _wd_presentable(self) -> bool:
+        """R27-C (B5): can this window PRESENT at all right now?  Observed
+        GTK state only — `visible` plus the R16-B `_surface_hidden()`
+        predicate (mapped + the measured WM-unmap surface-state bits).
+        Never an mpv getter (R9): these are the same C reads R16-B's vid
+        suppression already makes on every pump tick.
+
+        A screen-locked session unmaps/hides the window and `frame-drop-
+        count` then piles up with nothing wrong with the decoder (measured
+        on the operator's rig: 200+ drops, watchdog demoted vaapi-copy →
+        no).  Fullscreen sets NEITHER signal (R16 measured: state stays
+        0, surface stays mapped), so a real overload during fullscreen
+        still demotes normally.  Feeded to Sample.presentable; the freeze
+        arm lives in watchdog.feed()."""
+        return bool(self.get_visible()) and not self._surface_hidden()
+
     def _watchdog_tick(self) -> bool:
         if self._closing:
             return False
@@ -2029,9 +2189,11 @@ class ReelseeWindow(Gtk.ApplicationWindow):
             self._resume_id = None
         # R8-B: a pending correction or a file-poll outliving the window
         # would resize a dead surface (and spam a traceback per tick).
+        # R26: the deferred tail-rule attempt dies here too — never seek
+        # after the window is gone.
         for _sid in ("_aspect_debounce_id", "_aspect_guard_id",
                      "_aspect_file_id", "_aspect_hints_id",
-                     "_aspect_hints_wsrc"):
+                     "_aspect_hints_wsrc", "_resume_pending_id"):
             _src = getattr(self, _sid, None)
             if _src is not None:
                 GLib.source_remove(_src)
@@ -2046,6 +2208,9 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         if self._geom_id is not None:
             GLib.source_remove(self._geom_id)
             self._geom_id = None
+        # R21: a settle loop must die with its window — never re-issue a
+        # move against a surface that is on its way out.
+        self._geom_settle_stop()
         for _sid in ("_geom_timer", "_geom_guard_id"):
             _src = getattr(self, _sid, None)
             if _src is not None:
@@ -2067,6 +2232,9 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         return False   # let GTK finish destroying the window
 
     def dispose(self) -> None:  # noqa: D102 (GTK virtual)
+        # R21: a settle loop must not outlive its window (a close that never
+        # ran _on_close_request still ends the fight here).
+        self._geom_settle_stop()
         self.view.teardown()
         super().dispose()
 
@@ -2074,8 +2242,11 @@ class ReelseeWindow(Gtk.ApplicationWindow):
     # Every WHERE-decision is a pure function in src/wingeom.py (unit-tested
     # in tests/test_wingeom.py); this side is plumbing plus the Xlib seam
     # (src/x11pos.py) that GTK 4 refuses to offer.  Rules that live here:
-    #   * a NEW window takes the source window's EXACT size + shifted
-    #     position (cascade_place), the aspect lock does NOT refit it;
+    #   * a NEW window takes the source window's EXACT size + a position
+    #     moved toward the screen centre (centerward_place, R20 §0.2), the
+    #     aspect lock does NOT refit it;
+    #   * a remembered rect reopens VERBATIM unless >=2 of its corners are
+    #     off the current screen (R20 §0.1); only then is it clamped back;
     #   * only a WINDOWED rect is ever remembered (§A.2) — closing while
     #     fullscreen or maximized leaves the remembered rect untouched;
     #   * debounced saves (~250 ms) with an unconditional flush on close
@@ -2090,25 +2261,151 @@ class ReelseeWindow(Gtk.ApplicationWindow):
     def _geom_offset(self) -> int:
         try:
             return max(0, min(200, int(
-                self.cfg.get("ui.cascade_offset_px", 50))))
+                self.cfg.get("ui.cascade_offset_px", 15))))
         except (TypeError, ValueError):
-            return 50
+            return 15
 
     def _geom_monitor_areas(self) -> list:
+        """Monitors' WORK areas in PHYSICAL pixels — raw-Xlib placement
+        space; GTK's monitor geometry is LOGICAL (× scale_factor).
+
+        R22: under XWayland/HiDPI GTK reports a 2560x1440 monitor with
+        ``scale_factor=2`` while RandR's screen (and every rect x11pos
+        moves) is 5120x2880.  Comparing physical rects against those
+        logical areas dragged any window saved right of
+        ``logical_width - width`` onto the seam between the displays,
+        which is what "position resume still centres the window" was.
+        The panel stays in the math because the WORK AREA fields are
+        multiplied, not the offsets.  The scale lives HERE, in this
+        display-facing seam — ``wingeom`` stays pure."""
         try:
             mons = self.get_display().get_monitors()
         except Exception:                       # noqa: BLE001
             mons = []
-        return wingeom.work_areas(mons)
+        out = []
+        for m in mons or ():
+            try:
+                get = getattr(m, "get_workarea", None)
+                r = wingeom.norm_rect(get() if callable(get) else m)
+            except Exception:                   # noqa: BLE001
+                continue
+            if r is None:
+                continue
+            try:
+                fac = getattr(m, "get_scale_factor", None)
+                s = int(fac()) if callable(fac) else 1
+            except Exception:                   # noqa: BLE001
+                s = 1                           # unknown scale ⇒ today's math
+            s = max(1, s)                       # a 0/negative scale is a bug
+            out.append((r[0] * s, r[1] * s, r[2] * s, r[3] * s))
+        return wingeom.work_areas(out)
+
+    def _geom_monitor_geos(self) -> list:
+        """Every monitor's FULL geometry in PHYSICAL pixels — raw-Xlib
+        placement space; GTK's monitor geometry is LOGICAL (× scale_factor).
+
+        R20 §0.1 counts corners that are "not on the current screen", and
+        a corner under the panel IS on the screen: measured against the
+        work area it would count as off and the window would be dragged
+        fully on-screen — the exact behaviour the user is asking to stop.
+        Placement still clamps into the WORK area.
+
+        R22: the corner count has to be against the screen the window is
+        ACTUALLY on.  A 5120 px RandR screen reported as 2560 logical made
+        a rect on the user's right display score 4 corners off and get
+        clamped to the seam; scaling by ``get_scale_factor()`` puts the
+        screen and the rect in the same space again."""
+        try:
+            mons = self.get_display().get_monitors()
+        except Exception:                       # noqa: BLE001
+            return []
+        out = []
+        for m in mons or ():
+            try:
+                get = getattr(m, "get_geometry", None)
+                r = wingeom.norm_rect(get() if callable(get) else m)
+            except Exception:                   # noqa: BLE001
+                continue
+            if r is None:
+                continue
+            try:
+                fac = getattr(m, "get_scale_factor", None)
+                s = int(fac()) if callable(fac) else 1
+            except Exception:                   # noqa: BLE001
+                s = 1                           # unknown scale ⇒ today's math
+            s = max(1, s)
+            out.append((r[0] * s, r[1] * s, r[2] * s, r[3] * s))
+        return wingeom.work_areas(out)
 
     def _geom_monitor_index(self, rect):
-        """Which monitor the rect sits on (the index stored with it, §A)."""
+        """Which monitor the rect sits on (the index stored with it, §A).
+
+        PHYSICAL pixels — raw-Xlib placement space; GTK's monitor geometry
+        is LOGICAL (× scale_factor).  ``rect`` is a raw-Xlib rect, so the
+        monitor list must be physical too: against the logical list a
+        right-display rect overlaps nothing and the stored index is
+        meaningless (R22)."""
         try:
-            geos = [m.get_geometry()
-                    for m in self.get_display().get_monitors()]
+            mons = self.get_display().get_monitors()
         except Exception:                       # noqa: BLE001
             return None
-        return wingeom.pick_monitor(rect, wingeom.work_areas(geos))
+        out = []
+        for m in mons or ():
+            try:
+                get = getattr(m, "get_geometry", None)
+                r = wingeom.norm_rect(get() if callable(get) else m)
+            except Exception:                   # noqa: BLE001
+                continue
+            if r is None:
+                continue
+            try:
+                fac = getattr(m, "get_scale_factor", None)
+                s = int(fac()) if callable(fac) else 1
+            except Exception:                   # noqa: BLE001
+                s = 1                           # unknown scale ⇒ today's math
+            s = max(1, s)
+            out.append((r[0] * s, r[1] * s, r[2] * s, r[3] * s))
+        return wingeom.pick_monitor(rect, wingeom.work_areas(out))
+
+    def _geom_monitor_scales(self) -> list:
+        """Per-monitor scale factors (>= 1), parallel to the monitor list.
+
+        R25: the window's OWN size crosses the same physical/logical
+        boundary as the monitor extents R22 fixed.  GTK's
+        ``set_default_size`` takes LOGICAL px while every rect we save and
+        move is raw-Xlib PHYSICAL, so the conversion needs the scale of the
+        monitor the window is actually on — a mixed-DPI rig must not be
+        given its neighbour's factor.
+        """
+        try:
+            mons = self.get_display().get_monitors()
+        except Exception:                       # noqa: BLE001
+            return []
+        out = []
+        for m in mons or ():
+            try:
+                fac = getattr(m, "get_scale_factor", None)
+                s = int(fac()) if callable(fac) else 1
+            except Exception:                   # noqa: BLE001
+                s = 1                           # unknown scale ⇒ today's math
+            out.append(max(1, s))               # a 0/negative scale is a bug
+        return out
+
+    def _geom_scale_for(self, rect) -> int:
+        """Scale factor of the monitor holding a PHYSICAL rect.
+
+        1 when there is no display or no monitor info — that is today's
+        behaviour, so a scale=1 machine cannot regress from this path."""
+        scales = self._geom_monitor_scales()
+        if not scales:
+            return 1
+        try:
+            idx = self._geom_monitor_index(rect)
+        except Exception:                       # noqa: BLE001
+            idx = None
+        if idx is None or not 0 <= idx < len(scales):
+            idx = 0
+        return scales[idx]
 
     def _geom_windowed(self) -> bool:
         try:
@@ -2130,7 +2427,12 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         if w <= 1 or h <= 1:
             return None
         px, py = self._geom_rect[:2] if self._geom_rect else (0, 0)
-        return (px, py, w, h)
+        # R25: GTK reports LOGICAL w/h here, but window.json stores PHYSICAL
+        # x/y — the file must stay in ONE space or a scale=2 rig saves a
+        # half-size window that then reopens wrong.  x11pos is the physical
+        # truth on X11; this fallback has to match it.
+        fac = self._geom_scale_for((px, py, 1, 1))
+        return (px, py, int(round(w * fac)), int(round(h * fac)))
 
     def rect_for_cascade(self):
         """The rect a NEW window cascades from: the LIVE one while windowed,
@@ -2146,18 +2448,27 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         """(mode, rect) for THIS window, or None ⇒ plain default behaviour.
 
         Ordering (the §B.1 state table): a live source window ⇒ "cascade"
-        (exact source size, cascaded position on the SOURCE monitor);
-        no source but a remembered rect ⇒ "restore" (clamped into that
-        monitor's work area, size never grown); neither ⇒ None, and the
-        round-8 defaults (START_SIZE + initial aspect fit) stand.
+        (exact source size, moved 15 px toward the SOURCE monitor's centre,
+        R20 §0.2); no source but a remembered rect ⇒ "restore"; neither ⇒
+        None, and the round-8 defaults (START_SIZE + initial aspect fit)
+        stand.
+
+        The restore rule (R20 §0.1, the user's words): a window reopens at
+        the SAME coordinates and dimensions it was closed at, UNLESS at
+        least 2 of its corners are not on the current screen — only then
+        may it be repositioned, and clamp_into_workarea does that.  The
+        corner count is against the SCREEN (`_geom_monitor_geos`: panel
+        included, because a corner under the panel is on the screen), the
+        reposition still clamps into the monitor's WORK area.
         """
         if not self._geom_enabled():
             return None
         if source is not None:
             srect = source.rect_for_cascade()
             if srect is not None:
-                rect = wingeom.cascade_place(srect, self._geom_monitor_areas(),
-                                             self._geom_offset())
+                areas = self._geom_monitor_areas()
+                rect = wingeom.centerward_place(srect, areas,
+                                                self._geom_offset())
                 if rect is not None:
                     return ("cascade", rect)
         stored = self.app.geometry_store.last()
@@ -2167,7 +2478,16 @@ class ReelseeWindow(Gtk.ApplicationWindow):
             if idx is None or idx >= len(areas):
                 idx = wingeom.pick_monitor(stored, areas)
             wa = areas[idx] if idx is not None and idx < len(areas) else None
-            rect = wingeom.clamp_into_workarea(stored, wa) if wa else stored
+            if wa is None:
+                return ("restore", stored)
+            screens = self._geom_monitor_geos() or [wa]
+            off = wingeom.corners_offscreen(stored, screens)
+            if off is not None and off < 2:
+                # 0 or 1 corner off the screen ⇒ verbatim, NO clamp: the
+                # exact coords+dims the user closed it at (a corner under
+                # the panel stays under the panel).
+                return ("restore", stored)
+            rect = wingeom.clamp_into_workarea(stored, wa)
             if rect is not None:
                 return ("restore", rect)
         return None
@@ -2181,31 +2501,177 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         self._geom_rect = tuple(rect)
         self._geom_open = tuple(rect)
         self._geom_adopted = True
-        self.set_default_size(rect[2], rect[3])
+        # R25: `rect` is raw-Xlib PHYSICAL; set_default_size takes LOGICAL.
+        # Handed over unconverted, a 1828 px tall window became 3656
+        # physical at scale 2 — taller than the screen — so Mutter clamped
+        # the height and the aspect fit widened the result to near
+        # fullscreen.  That is "it always starts maximized now".
+        fac = self._geom_scale_for(rect)
+        self.set_default_size(int(round(rect[2] / fac)),
+                              int(round(rect[3] / fac)))
 
-    def apply_open_position(self, retry: bool = True) -> bool:
+    def apply_open_position(self) -> bool:
         """present() first, THEN configure: Xlib can only move a surface
-        that exists.  One retry at first-map for an xid that was not ready
-        yet; after that, size-only for good — on Wayland positioning simply
-        does not exist (x11pos logged it once and never raises)."""
+        that exists (GTK 4 has no move API at all).
+
+        R21: this used to be ONE move, ONE first-map retry, then "size-only
+        for good".  Under a real WM that single move can land before the
+        compositor finishes its own placement and is lost — the window stays
+        at the WM's centred spot, which is the bug the user sees.  It is now
+        the first step of a bounded SETTLE LOOP: apply, read the live rect
+        back through x11pos.get_rect (observed-only — R9 still forbids a
+        synchronous getter), and re-issue until the window is OBSERVED at
+        the target, the budget runs out, or the user takes the window.
+
+        True ⇒ the settle loop is armed (the position is being asserted);
+        False ⇒ nothing to apply (no plan, or the window is closing)."""
         rect, self._geom_open = self._geom_open, None
         if rect is None or self._closing:
             return False
-        self._geom_arm_guard(rect)      # our placement is not a user resize
-        if x11pos.set_rect(self, rect):
-            return True
-        if retry and self.get_surface() is None:
-            GLib.timeout_add(150, lambda: (self.apply_open_position(False),
-                                           False)[1])
+        return self._geom_settle_start(rect)
+
+    # ------------------------------------------------- R21 the settle loop --
+    def _geom_settle_start(self, rect) -> bool:
+        """Arm the loop and run its first attempt synchronously."""
+        self._geom_settle_stop()          # a re-apply replaces a live loop
+        self._geom_settle = {
+            "target": tuple(int(v) for v in tuple(rect)[:4]),
+            # The last rect we OBSERVED the window at — the position the WM
+            # last applied.  A live rect that differs from both this and the
+            # target did not come from us: the user grabbed the window.
+            # (The rect WE asked for is always the target, so comparing
+            # against that would read every lost move as a grab.)
+            "seen": None,
+            "left": GEOM_SETTLE_ATTEMPTS,
+            "deadline": time.monotonic() + GEOM_SETTLE_BUDGET_S,
+            "moves": 0,
+            "timer": None,
+        }
+        return self._geom_settle_step()
+
+    def _geom_settle_tick(self):
+        """GLib timer body: returns False so the timeout is not re-armed by
+        GLib as well as by us — a loop that did both fires twice per
+        interval, which is what a retry storm looks like."""
+        self._geom_settle_step()
         return False
 
-    def _geom_arm_guard(self, rect) -> None:
+    def _geom_settle_step(self) -> bool:
+        """One attempt: apply the move, read the live rect back, decide.
+        True ⇒ the loop is still asserting the target."""
+        st = self._geom_settle
+        if st is None:
+            return False
+        if self._geom_settle_aborted():
+            self._geom_settle_finish("aborted", None)
+            return False
+        if st["left"] <= 0 or time.monotonic() >= st["deadline"]:
+            self._geom_settle_finish("budget", self._geom_live_rect())
+            return False
+        target = st["target"]
+        st["left"] -= 1
+        self._geom_arm_guard(target, rearm=True)
+        if x11pos.set_rect(self, target):
+            st["moves"] += 1
+            self._geom_settle_moves += 1
+        live = x11pos.get_rect(self)      # observed-only read (R9)
+        spent = st["left"] <= 0 or time.monotonic() >= st["deadline"]
+        if live is None:
+            # No xid yet (the surface is still being created) or no X11 at
+            # all: nothing to observe, so nothing to conclude — keep trying
+            # until the budget says stop, and never read "unobservable" as
+            # "in place".
+            if spent:
+                self._geom_settle_finish("budget", None)
+                return False
+            return self._geom_settle_schedule()
+        if _rect_close(live, target):
+            self._geom_settle_finish("settled", live)
+            return False
+        if st["seen"] is not None and not _rect_close(live, st["seen"]):
+            # The window moved since the last time we looked, and it is at
+            # neither the target nor where we last saw it: that is a user
+            # grab, not the WM ignoring us.  Adopt their position and stop
+            # fighting — a placement loop must never outrace a human.
+            self._geom_settle_finish("user-grab", live)
+            return False
+        st["seen"] = live                 # stable and wrong ⇒ keep asserting
+        if spent:
+            self._geom_settle_finish("budget", live)
+            return False
+        return self._geom_settle_schedule()
+
+    def _geom_settle_schedule(self) -> bool:
+        st = self._geom_settle
+        if st is None:
+            return False
+        st["timer"] = GLib.timeout_add(GEOM_SETTLE_INTERVAL_MS,
+                                       self._geom_settle_tick)
+        return True
+
+    def _geom_settle_aborted(self) -> bool:
+        """Something that makes our placement moot: the window is closing,
+        or the user put it fullscreen/maximized mid-settle (moving a
+        fullscreen window is not our business).  A failing query means
+        "keep asserting" — the query is not the authority."""
+        if self._closing:
+            return True
+        try:
+            return bool(self._fs or self.is_fullscreen() or self.is_maximized())
+        except Exception:                       # noqa: BLE001
+            return False
+
+    def _geom_settle_disarm(self, st) -> None:
+        if st is not None and st.get("timer") is not None:
+            try:
+                GLib.source_remove(st["timer"])
+            except Exception:                   # noqa: BLE001
+                pass
+            st["timer"] = None
+
+    def _geom_settle_finish(self, reason: str, live) -> None:
+        """End the loop: adopt the observed truth, let sampling persist
+        again, and — only when we GAVE UP — say so, once."""
+        st, self._geom_settle = self._geom_settle, None
+        if st is None:
+            return
+        self._geom_settle_disarm(st)
+        if live is not None:
+            # The OBSERVED rect, not the target we asked for: keeping the
+            # truth here is what stops the 1 s sampler from seeing a
+            # phantom few-pixel change and persisting a position that
+            # drifts a little on every launch.
+            self._geom_rect = tuple(live)
+        self._geom_settle_reason = reason
+        if reason == "budget":
+            log.debug("R21: window position not reached after %d move(s) / "
+                      "%.1f s — accepting where the WM put it (%s, target %s)",
+                      st["moves"], GEOM_SETTLE_BUDGET_S, live, st["target"])
+
+    def _geom_settle_stop(self) -> None:
+        """Drop a live loop silently (re-apply, close, destroy)."""
+        st, self._geom_settle = self._geom_settle, None
+        self._geom_settle_disarm(st)
+
+    def _geom_arm_guard(self, rect, rearm: bool = False) -> None:
         """The surface-layout echo of our OWN configure must not read as a
         user resize (§B.1: the aspect lock resumes on the NEXT *user*
         resize).  Pre-seed the dedupe size and reuse round 8's applying
-        latch when nobody else holds it."""
+        latch when nobody else holds it.
+
+        rearm=True (the R21 settle loop): cancel OUR OWN previous guard
+        timer and start a fresh one, so every re-issued move is covered by
+        its own window instead of inheriting a guard that expires in the
+        middle of the settle — a lost echo would then read as a user resize
+        and the aspect lock would snap the window.  When the latch belongs
+        to somebody else (round 8's aspect apply) it is left alone: that
+        guard already covers our configure, and stealing it would release
+        the aspect lock early."""
         self._aspect_size = (rect[2], rect[3])
-        if self._aspect_applying:
+        if rearm and self._geom_guard_id is not None:
+            GLib.source_remove(self._geom_guard_id)
+            self._geom_guard_id = None
+        elif self._aspect_applying:
             return
         self._aspect_applying = True
 
@@ -2240,7 +2706,14 @@ class ReelseeWindow(Gtk.ApplicationWindow):
                 live = self._geom_live_rect()
                 if live is not None and live != self._geom_rect:
                     self._geom_rect = live
-                    self._geom_schedule_persist()
+                    # R21: while the settle loop is still fighting for the
+                    # target, do NOT persist — saving the WM's centred
+                    # position mid-fight would overwrite the rect the user
+                    # actually closed at.  Tracking above still follows the
+                    # truth; persistence resumes the moment the loop ends
+                    # (settled, budget-exhausted, or user-grab).
+                    if self._geom_settle is None:
+                        self._geom_schedule_persist()
         except Exception:                       # noqa: BLE001
             log.exception("geometry sample failed")
         return True
@@ -2256,11 +2729,37 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         self._geom_persist()
         return False
 
+    def _geom_store_monitor(self, rect):
+        """Which monitor index to store WITH this rect.
+
+        R24 §C.2: when the position is NOT observable — no xid, i.e. a
+        Wayland surface or an unmapped window — `_geom_live_rect()` keeps
+        the last KNOWN x/y and refreshes only the size, so an index
+        recomputed from that rect is arithmetic on a position we never
+        measured, and `plan_open_geometry` would trust it on the next
+        launch.  Carry forward the last index we actually MEASURED
+        (`GeometryStore.last_monitor()`).  On X11 the position IS measured,
+        so the index is recomputed exactly as before — the R22
+        physical-pixel math is untouched.
+
+        A store that cannot answer yields None: no index, never a guess,
+        and never an exception out of the save path."""
+        try:
+            observed = x11pos.get_rect(self) is not None
+        except Exception:                       # noqa: BLE001
+            observed = False
+        if observed:
+            return self._geom_monitor_index(rect)
+        try:
+            return self.app.geometry_store.last_monitor()
+        except Exception:                       # noqa: BLE001
+            return None
+
     def _geom_persist(self):
         if not self._geom_enabled() or self._geom_rect is None:
             return
         self.app.geometry_store.remember(
-            self._geom_rect, self._geom_monitor_index(self._geom_rect))
+            self._geom_rect, self._geom_store_monitor(self._geom_rect))
 
     def capture_geometry(self) -> None:
         """§A.1/A.2: the flush-on-close / flush-on-quit promise: sample the
@@ -2277,7 +2776,7 @@ class ReelseeWindow(Gtk.ApplicationWindow):
             if self._geom_enabled():
                 store.remember(
                     self._geom_rect,
-                    self._geom_monitor_index(self._geom_rect)
+                    self._geom_store_monitor(self._geom_rect)
                     if self._geom_rect else None,
                     windowed=windowed)
             store.flush()
@@ -2541,16 +3040,37 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         satisfied), on Wayland and on hint-ignoring servers it remains
         the whole mechanism.  Both x11pos entries degrade to False —
         publish failure is invisible, the correction path simply keeps
-        its old job."""
+        its old job.
+
+        R28 — the gate that keeps the declaration from becoming the bug:
+        a min==max PAspect published onto a window that VIOLATES it is an
+        invitation the WM accepts INSTANTLY (measured on Mutter: the seed
+        1200x900 was clamped to 1266x792 within one millisecond of the
+        write landing, no app-side resize logged anywhere near it — and on
+        the operator's rig the same fight walked the window down to 54x54
+        and persisted that).  So the pair is only declared while the LIVE
+        size agrees with it (aspect.hint_consistent); while it does not —
+        the adopted-geometry skip of §R10-B.1 leaves the window exactly in
+        this state — nothing is written, the WM has nothing to clamp, and
+        §R8-B's post-hoc correction stays the whole enforcement until the
+        next real resize makes the window honest, at which point the
+        debounced republish declares the lock for real."""
         if self._closing:
             return
         pair = self._aspect_hints_pair() if self._aspect_locked() else None
         if pair is None:
             x11pos.clear_aspect_ratio(self)
             self._hints_watch(False)
-        else:
-            x11pos.set_aspect_ratio(self, pair[0], pair[1])
-            self._hints_watch(True)
+            return
+        rect = self._geom_live_rect()
+        if rect is not None and not aspect.hint_consistent(
+                rect[2], rect[3], pair[0], pair[1]):
+            log.debug("aspect hints withheld: live %dx%d violates %d:%d",
+                      rect[2], rect[3], pair[0], pair[1])
+            self._hints_watch(False)
+            return
+        x11pos.set_aspect_ratio(self, pair[0], pair[1])
+        self._hints_watch(True)
 
     def _hints_watch(self, want: bool) -> None:
         """R14-B, and the reason this is a WATCH and not a one-shot:

@@ -28,6 +28,49 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
+def drain_retiring(workers, rc, *, cap=3.0, grace=10.0, hard_exit=os._exit,
+                   close_logging=logging.shutdown):
+    """Join the mpv-terminate workers a window close queued (§4.11), then make
+    sure the interpreter does not finalize while any of them is still running.
+
+    `mpv_terminate_destroy()` joins mpv's own threads and can take longer than
+    the cap on a loaded machine.  Returning from `run()` at that point lets
+    CPython finalize while libmpv's threads — and our event thread, which
+    wakes into Python and needs the GIL — are still alive, and a thread that
+    asks for the GIL after finalization has started cannot get it:
+    `Fatal Python error: gilstate_tss_set: failed to set current tstate (TSS)`
+    (SIGABRT) or a SIGSEGV, always AFTER the work is done, at exit.  Both are
+    what the battery's post-assert crashes looked like.
+
+    So: join with the cap, give a straggler a longer grace, and if it still
+    refuses to finish leave the process without running finalizers.  Nothing
+    is lost — the resume / A-B flush happens in `do_shutdown`, before `run()`
+    returns — but stdio and the log handlers are flushed first so a smoke's
+    `SMOKE_CHECK` / `SMOKE_ASSERTS_PASSED` lines are not truncated.
+    """
+    for t in workers:
+        t.join(timeout=cap)
+    stragglers = [t for t in workers if t.is_alive()]
+    if not stragglers:
+        return rc
+    log = logging.getLogger("reelsee")
+    log.warning("mpv terminate still running after %.1f s; waiting", cap)
+    for t in stragglers:
+        t.join(timeout=grace)
+    still = [t for t in stragglers if t.is_alive()]
+    if not still:
+        return rc                               # the grace was enough
+    log.warning("mpv terminate hung; exiting without finalizers")
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:                       # noqa: BLE001
+            pass
+    close_logging()
+    hard_exit(rc)
+    return rc
+
+
 def _split_cli(argv: list[str]) -> tuple[list[str], bool, list[str], bool]:
     """Return (targets, new_window, raw_mpv_args, simulate_overload).
     '--' starts raw mpv options (wired to the core in P10's CLI gate)."""
@@ -161,7 +204,8 @@ def run(argv: list[str] | None = None, on_app=None) -> int:
     anywhere reachable — R4-P3, the user-facing crash of 0.1.0."""
     logging.basicConfig(
         level=logging.DEBUG if os.environ.get("REELSEE_DEBUG") else logging.INFO,
-        format="%(levelname)s %(name)s: %(message)s")
+        format="%(levelname)s %(asctime)s.%(msecs)03d %(name)s: %(message)s",
+        datefmt="%H:%M:%S")
     argv = list(sys.argv if argv is None else argv)
 
     import config
@@ -176,6 +220,16 @@ def run(argv: list[str] | None = None, on_app=None) -> int:
 
     from config import Config
     cfg = Config()
+
+    # R24: decide the display backend HERE — after the config (the
+    # preference lives there) and before anything can open a Gdk display.
+    # Window positioning is X11-only, and the user's real launch paths
+    # (gtk-launch on a shadowed user-level .desktop, a terminal launch)
+    # carry no GDK_BACKEND, so without this the app becomes a native Wayland
+    # client whose position the compositor owns.  Never raises; the child of
+    # the re-exec below inherits the pin because it lives in os.environ.
+    import backendpin
+    backendpin.apply_pin(pref=cfg.get(backendpin.CONFIG_KEY, "auto"))
 
     import engine
     engine.apply_renderer_override(cfg)          # may re-exec; BEFORE gi!
@@ -286,7 +340,34 @@ def run(argv: list[str] | None = None, on_app=None) -> int:
             st = getattr(self, "_geometry_store_obj", None)
             if st is not None:
                 st.flush()               # even a windowless quit flushes dirty
+            # R23: the same quit path never calls forget_window either, so
+            # core.destroy() — mpv_terminate_destroy — never ran: mpv's own
+            # threads, plus our event thread (a PYTHON thread), outlived the
+            # interpreter.  A thread that asks for the GIL after finalization
+            # has started cannot get it, which is the exit-time
+            # "Fatal Python error: gilstate_tss_set: failed to set current
+            # tstate (TSS)" abort / SIGSEGV the battery kept tripping after
+            # every assertion had passed.  Terminate what is still open here:
+            # render context freed first with GL current (§0.6 — the window is
+            # still alive at this point), mpv terminated on a worker so the
+            # shutdown never blocks the loop (§4.11).
+            for w in list(getattr(self, "windows", ())):
+                self._retire_core(w)
             return Gtk.Application.do_shutdown(self)
+
+        def _retire_core(self, w) -> None:
+            """Free this window's render context with GL still current, then
+            terminate its mpv handle on a worker (§0.6 + §4.11).  Idempotent:
+            `teardown()` latches and `core.destroy()` checks `alive`."""
+            try:
+                w.view.teardown()
+            except Exception:                          # noqa: BLE001
+                logging.getLogger("reelsee").exception(
+                    "render teardown before mpv terminate failed")
+            t = threading.Thread(target=w.core.destroy, daemon=True,
+                                 name="mpv-terminate")
+            t.start()
+            self._retiring.append(t)
 
         # ------------------------------------------------------------ ab.json
         @property
@@ -484,10 +565,7 @@ def run(argv: list[str] | None = None, on_app=None) -> int:
             # render context was already detached+freed with GL current
             # (window close, §0.6) — terminate mpv on a WORKER so the main
             # loop never stalls (§4.11).
-            t = threading.Thread(target=w.core.destroy, daemon=True,
-                                 name="mpv-terminate")
-            t.start()
-            self._retiring.append(t)
+            self._retire_core(w)
 
     app = ReelseeApp()
     app.simulate_overload = simulate            # R-7 test flag (P7)
@@ -521,10 +599,10 @@ def run(argv: list[str] | None = None, on_app=None) -> int:
         on_app(app)
     rc = app.run(None)   # targets route through do_activate (see above)
 
-    # window closes queued terminate workers; join with a cap (§4.11)
-    for t in app._retiring:
-        t.join(timeout=3.0)
-    return rc
+    # window closes queued terminate workers; join with a cap (§4.11), and do
+    # not let the interpreter finalize under a straggler (exit-time abort /
+    # SIGSEGV — see drain_retiring).
+    return drain_retiring(app._retiring, rc)
 
 
 if __name__ == "__main__":

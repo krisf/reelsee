@@ -28,6 +28,17 @@ the section numbers stable when you edit it.
    from a filename, playlist entry, or settings field reaches
    `mpv_command_string` unfiltered.
 
+6. **Every new release gets published.** The public repo
+   (`github.com/krisf/reelsee`) must be kept current — a minted deb is not
+   DONE while the public tree is stale. After each mint phase closes its
+   gate, the operator runs `scripts/publish.sh --dry-run` (review the file
+   list) then `scripts/publish.sh -m <msgfile>`: `make_public.sh` mints the
+   public tree from HEAD and REFUSES on any leak-pattern match, and the
+   push happens from a fresh clone under the noreply identity. DSH runs
+   never push — publishing is the operator close-out. Never commit
+   `scripts/leak-patterns.txt`; never name its contents in anything that
+   ships. (User order 2026-11-06, mirrored in looksee PLAN §27.)
+
 ## The libmpv facts that are not obvious
 
 All of these were established by running code, not by reading docs; the
@@ -73,9 +84,33 @@ spike that proves the render path is kept at
   state directory inherit each other's rect and produce results that look
   like correctness (`R10-fix` purges `window.json` per invocation). Give
   every phase its own `REELSEE_STATE_DIR`.
+* **A remembered position inside the last 10 % of the runtime is NOT
+  restored** (R26): `_resume_restore()` drops the entry and plays from 0 when
+  `dur - pos < playback.resume_tail_frac * dur` — strictly less, so a position
+  with exactly 10 % left still resumes. `duration` only exists in the async
+  observed snapshot (R9: the GTK thread never calls a sync mpv getter) and
+  `file-loaded` can beat it, so the check is a **bounded retry**
+  (`GLib.timeout_add(150 ms, …)`, ~2 s, id kept on `self._resume_pending_id`
+  and cancelled by a second load, a second restore call or window teardown);
+  if the duration never arrives it falls back to seeking, so resume can never
+  get worse than before. `_resume_record()`'s own `pos >= dur - 1.0` deletion,
+  the 300 s `resume_min_s` floor and the 5 s tick are untouched.
+  `tests/test_resume_tail_r26.py` and `scripts/smoke_resume_tail.py` gate both
+  directions (the mid-file phase is the negative control).
 * Window *placement* is not a GTK4 capability. On X11 it is a raw Xlib
   `MoveResizeWindow`; on Wayland it is impossible by protocol, so tests
   must assert size-exactness and treat the offset as best-effort.
+* **The app pins its own GDK backend** (`src/backendpin.py`, called from
+  `reelsee.run()` before `gi` is imported). Positioning only exists on X11,
+  and a `.desktop` `Exec=` pin is not durable — user-level entries shadow the
+  packaged one and a terminal launch carries no env at all, which shipped
+  0.2.7 as an unpositioned native Wayland client. `pin_decision` pins
+  `GDK_BACKEND=x11` only inside a provable XWayland session (socket on disk),
+  never raises, and is overridden by `GDK_BACKEND` or `REELSEE_BACKEND_PIN`.
+  `scripts/headless-smoke.sh` exports `GDK_BACKEND=x11`, so **no smoke covers
+  the unpinned path** — `smoke_backendpin.py` is the gate that does, and
+  `smoke_geomresume.py`'s no-xid phase is the negative control proving the
+  position assertions can actually fail.
 * `config_dir()` and `state_dir()` resolve to `~/.config/reelsee` and
   `~/.local/state/reelsee` and **ignore** `XDG_CONFIG_HOME` /
   `XDG_STATE_HOME`. To point the app at a scratch home, set
@@ -111,9 +146,28 @@ scripts/p11_battery.sh                             # the full acceptance battery
 * Gate races we have actually been bitten by: reading a config value before
   the app has parsed it (poll for the parsed value with a deadline), and two
   phases sharing one state directory (give every phase its own).
-* GPU demotion must never trigger on dropped frames alone: healthy FPS with
-  drops is a *presentation* problem and switching to CPU decode cannot fix
-  it. The watchdog requires fps degradation as well (`src/watchdog.py`).
+- **GPU demotion on dropped frames requires a SUSTAINED streak (R19):** a
+  single-sample drop spike with healthy FPS is a seek/flush artifact and must
+  never demote (the R7 false-positive guard), but sustained drops-only
+  overload — 5 consecutive samples (`DROP_CONFIRM`) with fps healthy — DOES
+  demote (`reason="drops"`): that is the GPU-decode presentation-stall
+  signature the user reported after R18 made engagement actually succeed.
+  fps-starved overload keeps the 3-sample confirm path (`src/watchdog.py`).**
+* **`window.json` is always PHYSICAL pixels (R25).** Two coordinate spaces
+  exist on a HiDPI/XWayland desktop: raw-Xlib rects (physical) and GTK's
+  `set_default_size` / `get_width` / `Gdk.Monitor` geometry (logical =
+  physical ÷ `get_scale_factor()`). The invariant is that persisted rects and
+  `x11pos` moves are physical, and the conversion happens at exactly two
+  seams in `src/window.py`: `adopt_geometry` DIVIDES by the scale before
+  `set_default_size`, and `_geom_live_rect`'s Wayland fallback MULTIPLIES
+  GTK's logical size before storing it. Getting either wrong does not fail
+  loudly — Mutter clamps the over-tall window to the screen and the aspect
+  fit widens it, so the user sees a *maximized* window. `wingeom.py` stays
+  pure and never learns about scale; the scale is read per-monitor via
+  `_geom_scale_for(rect)` so a mixed-DPI rig gets the right factor.
+  **Every Xvfb gate runs at scale 1, where this whole class of bug is
+  invisible** — `tests/test_scale_geom_r25.py` is the only coverage, and it
+  fakes `scale=2`. Do not "simplify" either seam back to a raw pass-through.
 * Screenshots: popovers and context menus cannot be captured under Xvfb
   without a compositor — they are dismissed on focus-out instantly.
   `scripts/make_screenshots.py` therefore documents why the README has no

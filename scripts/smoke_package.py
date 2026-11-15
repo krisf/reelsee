@@ -193,6 +193,18 @@ def main() -> int:
         finish()
         return 1
 
+    # R26: the artifact NAME must carry the control version.  control's
+    # Version: and packaging/build-deb.sh's VER= are independent knobs;
+    # bumping only control once produced an artifact whose NAME carried the
+    # previous version while it CONTAINED the new one, silently overwriting
+    # the previous release's artifact — and
+    # because _resolve_deb() falls back to the newest buildout/*.deb, every
+    # check below stayed green on that misnamed file.  (smoke_installed_paths.py
+    # resolves strictly by name, so it did catch it; close the gap here too.)
+    want_name = f"reelsee_{PKG_VERSION}_all.deb"
+    check("deb_name_matches_version", os.path.basename(DEB) == want_name,
+          f"{os.path.basename(DEB)} (control declares {want_name})")
+
     r = subprocess.run(["dpkg-deb", "-I", DEB], capture_output=True,
                        text=True)
     ctrl = {}

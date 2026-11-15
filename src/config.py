@@ -53,6 +53,12 @@ DEFAULTS: dict = {
     # one-time run_migrations() migrates pre-0.x stored "no" values.
     "playback": {"speed": 1.0, "loop_file": "inf", "loop_playlist": "no",
                  "autoplay": True, "resume": True, "resume_min_s": 300,
+                 # R26: a remembered position inside the last 10 % of the
+                 # runtime is NOT restored — the file plays from 0 and the
+                 # stale entry is dropped.  Clamped to [0, 0.5] at the read
+                 # site (window.py) so a bad value can never make every
+                 # video restart; 0 disables the rule.
+                 "resume_tail_frac": 0.10,
                  "preload_next": False, "keep_open": True,
                  "pitch": True, "video_off": False, "cover_art": "albumart",
                  # R16-B: a minimized (unmapped) window stops DECODING video
@@ -82,7 +88,20 @@ DEFAULTS: dict = {
            # R10: remember the last WINDOWED rect (<state>/window.json, NOT
            # this file) and cascade new windows off the open one.  The
            # remembered GEOMETRY is state; these two are the user's policy.
-           "remember_geometry": True, "cascade_offset_px": 50},
+           # R20 §0.2: the cascade is CENTERWARD (toward the screen centre)
+           # and 15 px by default; §0.1: a remembered rect reopens verbatim
+           # unless >=2 of its corners are off the current screen.
+           "remember_geometry": True, "cascade_offset_px": 15,
+           # R24: which display backend the app asks GDK for.  Window
+           # POSITIONING only exists on X11 (GTK 4 has no move API;
+           # xdg-shell has no position request), so on Wayland the
+           # remembered rect is size-only and the compositor centres the
+           # window.  "auto" = pin x11 inside an XWayland session we can
+           # PROVE (WAYLAND_DISPLAY + DISPLAY + the X socket exists);
+           # "x11" pins unconditionally; "wayland" never pins.  An explicit
+           # GDK_BACKEND / REELSEE_BACKEND_PIN in the environment beats all
+           # three (src/backendpin.py).
+           "x11_backend": "auto"},
     "subtitles": {"visible": True, "scale": 1.0, "delay_s": 0.0,
                   "auto": "exact", "font": "sans-serif", "font_size": 55.0,
                   "color": "#ffffff", "border_size": 3.0, "margin_y": 50.0},
@@ -459,11 +478,17 @@ class GeometryStore:
         remembered rect byte-for-byte (§A.2);
       * writes are debounced (DEBOUNCE_S, like the config) and flush()
         fires on close/quit even when the debounce never got its turn —
-        "save on quit" is a promise, not a race (§A.1).
+        "save on quit" is a promise, not a race (§A.1);
+      * R28-D: a rect below the usable-window floor (wingeom.FLOOR_W/H —
+        the app's own aspect.MIN_W/MIN_H, 320x180) is NEVER persisted and
+        a file that already holds one is REPAIRED on load to a sane 16:9
+        rect (one INFO line, nothing raises).  This is what makes
+        "launch, no window" impossible even if some WM still clamps: the
+        operator's 102x102/100x100 files heal themselves on next start.
     """
 
     def __init__(self, path: Path | None = None,
-                 debounce_s: float = DEBOUNCE_S):
+                 debounce_s: float = DEBOUNCE_S, work=None):
         self.path = Path(path) if path else state_dir() / "window.json"
         self.debounce_s = debounce_s
         self._lock = threading.Lock()
@@ -471,6 +496,16 @@ class GeometryStore:
         self._dirty = False
         raw = load_raw(self.path)
         rect = wingeom.valid_rect(raw.get("rect") if raw else None)
+        if rect is not None and wingeom.below_floor(rect):
+            fixed = wingeom.repair_tiny_rect(rect, work)
+            if fixed is not None:
+                import logging
+                logging.getLogger("reelsee.config").info(
+                    "window.json rect %s is below the usable floor "
+                    "(%dx%d) — repaired to %s", rect,
+                    wingeom.FLOOR_W, wingeom.FLOOR_H, fixed)
+                rect = fixed
+                self._dirty = True          # the FILE heals on next flush
         self._rect: tuple | None = rect      # the remembered windowed rect
         self._monitor = wingeom.valid_monitor(
             raw.get("monitor") if raw else None)
@@ -495,12 +530,14 @@ class GeometryStore:
         must leave the remembered size intact) — it still reports False so
         the caller can see that nothing changed.  An invalid rect is
         dropped silently: garbage from a buggy caller is treated exactly
-        like a corrupt file.
+        like a corrupt file.  R28-D: so is an UNUSABLE one — a rect below
+        wingeom.FLOOR_W/H (320x180) never reaches the disk, whatever the
+        window manager did to the live window five milliseconds ago.
         """
         if not windowed:
             return False
         r = wingeom.valid_rect(rect)
-        if r is None:
+        if r is None or wingeom.below_floor(r):
             return False
         mon = wingeom.valid_monitor(monitor)
         with self._lock:

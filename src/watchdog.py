@@ -2,10 +2,12 @@
 applier.
 
 One 1 s sample per tick (fields from the observed Snapshot only — R10).
-Three consecutive overloaded samples (after the startup grace, never while
-pause/seeking/idle/eof/container_fps==0/hwdec already "no") demote ONE step
-in the fallback chain, then a 3 s cooldown and re-arm.  Applying is the
-P0-PROOF-A mechanism (set hwdec + vid no/auto — never a seek, never audio).
+Three consecutive fps-starved samples — or, since ROUND19, five consecutive
+samples whose ONLY overload signal is a sustained drop-rate above the
+ceiling — demote ONE step in the fallback chain (after the startup grace,
+never while pause/seeking/idle/eof/container_fps==0/hwdec already "no"),
+then a 3 s cooldown and re-arm.  Applying is the P0-PROOF-A mechanism
+(set hwdec + vid no/auto — never a seek, never audio).
 
 `decide()`-style state lives in Watchdog.feed(); every rule is pure given
 (Sample, thresholds, mode, clock) so tests drive it with fake clocks.
@@ -20,6 +22,8 @@ log = logging.getLogger("reelsee.watchdog")
 
 GRACE_S = 4.0                 # max(4 s, 2 × 1-s fps sample window)
 CONFIRM = 3                   # consecutive overloaded samples
+DROP_CONFIRM = 5              # consecutive drop-overloaded samples
+                              # (5 s at the 1 s cadence) — ROUND19 §A.1
 COOLDOWN_S = 3.0              # wait after an action, then re-arm
 
 #: demote chains (Appendix C); key = current hwdec mode base
@@ -127,6 +131,13 @@ class Sample:
     # positional Sample(...) construction keeps working.
     paused_for_cache: bool = False
     cache_buffering_state: int | None = None
+    # R27-C (B5): can this window PRESENT at all right now?  Observed
+    # window state only (mapped / visible / surface-state bits — the same
+    # facts R16-B reads; never an mpv getter, R9).  False while minimized
+    # or unmapped: an un-presentable window piles up `frame-drop-count`
+    # without anything being wrong with the decoder, and the drops path
+    # demoted a healthy GPU on the OPERATOR's LOCKED session (200+ drops).
+    presentable: bool = True
 
     def skip(self) -> bool:
         # Fully-ignored samples.  hwdec "no" is NOT skipped here: Appendix C
@@ -140,6 +151,11 @@ class Sample:
         """R17-D: this sample was taken while mpv was still filling its
         cache — see `is_buffering`."""
         return is_buffering(self.paused_for_cache, self.cache_buffering_state)
+
+    def unpresentable(self) -> bool:
+        """R27-C (B5): the sample came from a window that cannot present
+        (minimized / unmapped / hidden) — mirror of `buffering()`."""
+        return not self.presentable
 
 
 def is_buffering(paused_for_cache, cache_buffering_state) -> bool:
@@ -201,6 +217,10 @@ class Watchdog:
         self.clock = clock
         self._grace_until = 0.0
         self._streak = 0
+        # ROUND19 §A.2: the drops-only overload streak (healthy fps, drops
+        # over the ceiling) — its own counter so the CONFIRM=3 fps path and
+        # the DROP_CONFIRM=5 drops path never contaminate each other.
+        self._drop_streak = 0
         self._cool_until = 0.0
         self._prev: Sample | None = None
         self._demoted = False           # any demotion applied this session
@@ -232,6 +252,7 @@ class Watchdog:
         """Startup grace + full re-arm per file (Appendix C)."""
         self._grace_until = self.clock() + GRACE_S
         self._streak = 0
+        self._drop_streak = 0
         self._prev = None
         self._cool_until = 0.0
         self._terminal_toasted = False
@@ -257,6 +278,7 @@ class Watchdog:
             # below would otherwise step the chain from "no").  Baseline is
             # kept fresh so release after a toggle-back starts clean.
             self._streak = 0
+            self._drop_streak = 0
             return None
         if now < self._grace_until or s.skip():
             return None
@@ -270,9 +292,30 @@ class Watchdog:
             # above, so the next non-buffering sample measures its delta
             # against the newest sample rather than against a stale one.
             log.debug("watchdog: buffering sample (paused-for-cache=%s "
-                      "cache-buffering-state=%s) — streak frozen at %d",
+                      "cache-buffering-state=%s) — streaks frozen at "
+                      "fps=%d drops=%d",
                       s.paused_for_cache, s.cache_buffering_state,
-                      self._streak)
+                      self._streak, self._drop_streak)
+            return None
+        if s.unpresentable():
+            # R27-C (B5): the window CANNOT present right now — minimized,
+            # hidden, or unmapped.  A screen-locked session looks EXACTLY
+            # like this (the operator's live rig: 200+ consecutive drops
+            # while the screen was locked, then the drops path demoted a
+            # healthy vaapi-copy to CPU).  An un-presentable window is not
+            # an overloaded decoder, so this sample FREEZES the streaks in
+            # exactly the R17-D manner: no increment (invisible drops are
+            # not overload) and no reset (a real overload that pauses
+            # behind a minimize must still demote when the window returns).
+            # `_prev` was already updated above, so the drop-count
+            # accumulated while invisible is absorbed sample-by-sample by
+            # the frozen samples themselves — the first presentable sample
+            # after a restore measures ONE interval, never the whole lock-
+            # screen span.  Observed window state only (mapped/visible/
+            # surface-state bits) — never an mpv getter (R9).
+            log.debug("watchdog: unpresentable sample (window cannot "
+                      "present) — streaks frozen at fps=%d drops=%d",
+                      self._streak, self._drop_streak)
             return None
         base = mode_base(s.hwdec)
         if base == "no" and (self._cfg_cpu
@@ -288,17 +331,31 @@ class Watchdog:
         dt = max(0.001, s.t - prev.t)
         fps_ratio, drop_ratio = ratios(s, prev, dt)
         raw = raw_counters(s, prev, dt)
-        # D2 (R7): the drop-ceiling path may ONLY fire when fps_ratio is
-        # also below the floor, or unknown (no estimated-vf-fps yet).  A
-        # healthy fps with a big burst of drop-counter movement — a seek
-        # flush, a counter saturation artifact — must NEVER demote: that
-        # was the observed false positive (fps_ratio=1.00, drop_ratio=0.97
-        # demoted).  fps below the floor remains the one positive signal.
+        # D2 (R7) as amended by ROUND19 §A.3: the drop-ceiling path used to
+        # fire ONLY when fps_ratio was also below the floor or unknown,
+        # because the observed false positive was a SINGLE sample with
+        # fps_ratio=1.00 / drop_ratio=0.97 demoting (a seek/counter flush).
+        # That blanket gate also suppressed the REAL overload signature the
+        # operator measured on the live rig (ROUND19-BRIEF §0 "Signature A"):
+        # decode healthy (estimated-vf-fps == container-fps == 59.94) while
+        # the DISPLAY/RENDER path drops 15 of 59.94 frames per second —
+        # fps_ratio=1.00, so feed() returned no action for all 8 samples and
+        # the automatic GPU→CPU fallback never happened.  The rule is now:
+        # healthy fps + drops over the ceiling DOES demote, but only after a
+        # SUSTAINED DROP_CONFIRM=5 streak; the R5 single-sample flush
+        # artifact still can never demote (one spike, then clean samples).
+        # Gate: tests/test_watchdog.py::R19DropsOverload (B1) + the split D2
+        # fixture (B2) — both halves pinned.
         fps_low = (fps_ratio is not None and fps_ratio < self.fps_floor)
-        overloaded = fps_low or (fps_ratio is None
-                                 and drop_ratio > self.drop_ceiling)
-        if not overloaded:
-            self._streak = 0            # ANY clean sample resets confirm
+        # "no estimated-vf-fps yet" keeps the original CONFIRM=3 path (§A.3)
+        unknown_drops = (fps_ratio is None
+                         and drop_ratio > self.drop_ceiling)
+        # the previously-suppressed region: fps healthy AND drops over ceiling
+        drops_only = (fps_ratio is not None
+                      and drop_ratio > self.drop_ceiling)
+        if not (fps_low or unknown_drops or drops_only):
+            self._streak = 0            # ANY clean sample resets BOTH streaks
+            self._drop_streak = 0
             return None
         # D2: every positive decision carries/logs its RAW inputs.
         log.debug("watchdog: overload signal fps_ratio=%s drop_ratio=%s "
@@ -310,8 +367,15 @@ class Watchdog:
                   raw["frame_delta"], raw["dt"], s.hwdec)
         if now < self._cool_until:
             return None                 # don't count during the 3 s wait
-        self._streak += 1
-        if self._streak < CONFIRM:
+        if fps_low or unknown_drops:
+            self._streak += 1
+            reason = "fps"
+            fired = self._streak >= CONFIRM
+        else:
+            self._drop_streak += 1
+            reason = "drops"
+            fired = self._drop_streak >= DROP_CONFIRM
+        if not fired:
             return None
         frm = mode_base(s.hwdec)
         if (frm == "no" and self._chain is not None
@@ -324,11 +388,12 @@ class Watchdog:
             if step is None:
                 return None
             act = {"kind": "demote", "from": from_mode, "to": step,
-                   "retry": True,
+                   "retry": True, "reason": reason,
                    "fps_ratio": round(fps_ratio, 4) if fps_ratio
                    is not None else None,
                    "drop_ratio": round(drop_ratio, 4), "raw": raw}
             self._streak = 0
+            self._drop_streak = 0
             self._cool_until = now + COOLDOWN_S
             self._demoted = True
             self.last_action = act
@@ -342,7 +407,7 @@ class Watchdog:
         if not chain:                   # terminal (cpu / already "no")
             if not self._terminal_toasted:
                 self._terminal_toasted = True
-                act = {"kind": "toast",
+                act = {"kind": "toast", "reason": reason,
                        "text": "Playback still dropping — CPU decode is "
                                "the limit for this file", "raw": raw}
                 self.last_action = act
@@ -352,6 +417,7 @@ class Watchdog:
                 return act
             return None
         act = {"kind": "demote", "from": frm, "to": chain[0],
+               "reason": reason,
                "fps_ratio": round(fps_ratio, 4) if fps_ratio is not None
                else None,
                "drop_ratio": round(drop_ratio, 4), "raw": raw}
@@ -365,12 +431,13 @@ class Watchdog:
             if chain[0] == "no":
                 self._chain.exhausted = True
         self._streak = 0
+        self._drop_streak = 0
         self._cool_until = now + COOLDOWN_S
         self._demoted = True
         self.last_action = act
-        log.info("watchdog: DEMOTE decision %s → %s (fps_ratio=%s "
+        log.info("watchdog: DEMOTE decision %s → %s (reason=%s fps_ratio=%s "
                  "drop_ratio=%s frame_drop=%s dec_drop=%s dropped=%s "
-                 "dt=%s)", frm, chain[0], act["fps_ratio"],
+                 "dt=%s)", frm, chain[0], reason, act["fps_ratio"],
                  act["drop_ratio"], raw["drop"], raw["dec_drop"],
                  raw["dropped"], raw["dt"])
         return act
@@ -385,16 +452,24 @@ class Sampler:
     end-to-end headless, where a real GPU overload cannot be reproduced."""
 
     def __init__(self, core, simulate: bool = False, container: float = 30.0,
-                 clock=None):
+                 clock=None, presentable=None):
         self.core = core
         self.simulate = simulate
         self.container = container
         self.clock = clock or time.monotonic
+        # R27-C (B5): zero-argument callable returning whether the OWNING
+        # window can present right now (observed GTK state: mapped/visible/
+        # surface-state bits — never an mpv getter, R9).  None = always
+        # presentable (tests, simulate mode, any caller that does not wire
+        # it): the pre-R27 behaviour, so nothing existing changes.
+        self._presentable = presentable
         self._t0 = self.clock()
         self._n = 0
 
     def sample(self) -> Sample:
         now = self.clock()
+        pres = True if self._presentable is None else bool(
+            self._presentable())
         if self.simulate:
             self._n += 1
             frame_delta = self.container * 0.5          # vf at half rate
@@ -423,7 +498,8 @@ class Sampler:
             paused_for_cache=bool(snap.get("paused-for-cache")),
             cache_buffering_state=(
                 None if snap.get("cache-buffering-state") is None
-                else int(snap.get("cache-buffering-state"))))
+                else int(snap.get("cache-buffering-state"))),
+            presentable=pres)
 
 
 class EngagementWatcher:

@@ -14,6 +14,12 @@ run() { # name timeout script
         echo "BATTERY $1 FAIL (log: scratch/smoke/$RUN_ID/p11_$1.log)"
         fails=$((fails+1))
     fi
+    # R28: the flat log IS the evidence — copy it into the run dir this
+    # script cites, so `logs=scratch/smoke/$RUN_ID` names files that exist
+    # (R26/R27 cited directories that were empty; a claim without an
+    # on-disk log is not evidence) and the Traceback audit below finally
+    # reads real bytes instead of a path that never existed.
+    cp -f "scratch/smoke/p11_$1.log" "scratch/smoke/$RUN_ID/" 2>/dev/null || true
     if grep -q Traceback "scratch/smoke/$RUN_ID/p11_$1.log" 2>/dev/null; then
         echo "BATTERY $1 TRACEBACK-IN-LOG"
         fails=$((fails+1))
@@ -23,20 +29,36 @@ run_needle() { # name timeout script needle [args...]
     # Same as run(), plus: the script must have PRINTED `needle`, and it may
     # take arguments.  A harness that exits 0 without ever emitting its summary
     # line is a vacuous pass, and a self-test must not be able to pass
-    # vacuously.  (Log path is the FLAT scratch/smoke/<name>.log that
-    # headless-smoke.sh writes — not the per-run directory.)
+    # vacuously.
     if scripts/headless-smoke.sh "p11_$1" --timeout "$2" -- \
-            /usr/bin/python3 "scripts/$3" "${@:5}" >/dev/null 2>&1 \
-            && grep -q "$4" "scratch/smoke/p11_$1.log" 2>/dev/null; then
+            /usr/bin/python3 "scripts/$3" "${@:5}" >/dev/null 2>&1; then
+        rc=0
+    else
+        rc=1
+    fi
+    # R28: same rule as run() — cite only logs that exist in the run dir.
+    cp -f "scratch/smoke/p11_$1.log" "scratch/smoke/$RUN_ID/" 2>/dev/null || true
+    if [ "$rc" -eq 0 ] && grep -q "$4" "scratch/smoke/$RUN_ID/p11_$1.log" 2>/dev/null; then
         echo "BATTERY $1 PASS"
     else
-        echo "BATTERY $1 FAIL (log: scratch/smoke/p11_$1.log)"
+        echo "BATTERY $1 FAIL (log: scratch/smoke/$RUN_ID/p11_$1.log)"
         fails=$((fails+1))
     fi
 }
 run render        60 smoke_render.py
+# R23: the fullscreen / maximize unrealize->realize cycle (double-clicking the
+# header used to crash the app: a leaked render context on the second toggle,
+# then SIGABRT).  Drives two full on->off cycles and asserts a live render
+# context, a non-black capture and a resumed pump after each one.
+run render_cycle   90 smoke_render_cycle.py
 run mpv_roundtrip 60 smoke_mpv_roundtrip.py
 run close         45 smoke_close.py
+# R23: app.quit() never fires a window close-request, so mpv used to be left
+# running when the app exited — libmpv's threads plus our Python event thread
+# outlived the interpreter and aborted it at finalization (the post-assert
+# SIGABRT/SIGSEGV that spoiled the battery).  This gate quits WITHOUT closing
+# the window and asserts the handle really was terminated on the way out.
+run quit_terminate 60 smoke_quit_terminate.py
 run chrome        45 smoke_chrome.py
 run adwchrome    120 smoke_adwchrome.py
 # R12: the overlay-chrome contract (video owns the whole client area;
@@ -189,6 +211,42 @@ run hiddensuppress_c 300 smoke_hiddensuppress.py
 # llvmpipe numbers have no relationship to the real iGPU.
 run_needle bench_multidecode 180 bench_multidecode.py "ok=1" \
     --hwdec no --n 2 --duration 6
+# R24: position resume over a REAL relaunch (seed -> restore -> drag -> save),
+# with a no-xid negative control that proves the position assertions can fail
+# rather than measuring "the app started".  And the backend pin in the REAL
+# boot path — the gap that let an unpinned launch ship as a native Wayland
+# client whose position the compositor owns.
+run geomresume 60 smoke_geomresume.py
+run backendpin 45 smoke_backendpin.py
+# R26: a remembered position inside the last 10% of the runtime is NOT
+# restored (plays from 0, stale entry dropped), while a mid-file position
+# still resumes — the second phase is the negative control that proves the
+# first cannot pass vacuously.
+run resume_tail 90 smoke_resume_tail.py
+# R27: the fullscreen cycle in the REAL APP, OUT OF PROCESS, on a private
+# Xvfb :97 — the shape every other smoke lacks (they all run in-process
+# under headless-smoke.sh with REELSEE_HEADLESS=1, which is exactly how the
+# "fullscreen goes black" shipped).  Real entry point, WM_CLASS lookup, XTEST
+# 'f' keysym, xwd luma AND the app's own screenshot as a second witness.
+run fullscreen_real 180 smoke_fullscreen_real.py
+# R28: the WM_NORMAL_HINTS publication audited ON THE SERVER — a real GTK
+# window, the real x11pos seam, python-xlib read-back: PAspect is bit 128
+# (the pre-R28 constant was PMaxSize, 32, so we advertised "max 0x0" and
+# the operator's Mutter clamped the window to its content minimum), a
+# max-0,0 array NEVER ships the PMaxSize flag, a live maximum survives
+# publish AND clear, identical re-publishes announce NOTHING (PropertyNotify
+# counted at a second client), and the planted pre-R28 byte-signature comes
+# back healed.  The Xvfb half; the clamping half is the :0 repro in
+# scripts/aspect_ratchet.py.
+run hintsbits 90 smoke_hintsbits_r28.py
+# R28 second cause: a min==max PAspect published onto a window whose live
+# size VIOLATES it makes a real WM clamp that window the same millisecond
+# (Mutter, 1200x900 -> 1266x792 in 1 ms).  This gate proves the app-side
+# contract under a WM-less Xvfb: NO declaration while the size is off-
+# ratio, the seed rect HELD, and the pair declared (bit 128, 16:9 pinned)
+# only once the size is honest again.  Negative control: against HEAD's
+# src the same script fails both "never publish" checks (verified).
+run hintgate 180 smoke_hintgate_r28.py
 ln -sfn "$RUN_ID" scratch/smoke/latest 2>/dev/null || true
 echo "BATTERY_SUMMARY fails=$fails logs=scratch/smoke/$RUN_ID"
 [ "$fails" -eq 0 ]

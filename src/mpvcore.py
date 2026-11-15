@@ -109,7 +109,12 @@ class MpvCore:
         """Async command (mpv_command_async) — never blocks the main loop."""
         uid = next(self._uids)
         arr = M.make_command(*argv)
-        self._cmd_refs[uid] = arr
+        # keep BOTH: the ctypes array alive for the duration of the command
+        # and the argv itself so the error reply below can name the culprit
+        # (R27-A: "command reply error" without the argv is unauditable).
+        # The text is joined ONLY in the error path — commands also run on
+        # hot paths (volume drags), and this must cost nothing otherwise.
+        self._cmd_refs[uid] = (arr, argv)
         rc = self.lib.mpv_command_async(self.h, uid, arr)
         if rc < 0:
             self._cmd_refs.pop(uid, None)
@@ -189,6 +194,23 @@ class MpvCore:
             if not ev:
                 continue
             eid = ev.contents.event_id
+            # R27-A measurement: one line per LIFECYCLE event (never per
+            # property-change) — the trail that shows whether mpv was told
+            # to stop loading, or merely stopped delivering frames.
+            if eid in (M.MPV_EVENT_SHUTDOWN, M.MPV_EVENT_START_FILE,
+                       M.MPV_EVENT_END_FILE, M.MPV_EVENT_FILE_LOADED,
+                       M.MPV_EVENT_IDLE, M.MPV_EVENT_SEEK,
+                       M.MPV_EVENT_PLAYBACK_RESTART,
+                       M.MPV_EVENT_VIDEO_RECONFIG):
+                _extra = ""
+                if eid == M.MPV_EVENT_END_FILE and ev.contents.data:
+                    ef = M.ctypes.cast(
+                        ev.contents.data,
+                        M.ctypes.POINTER(M.MpvEventEndFile)).contents
+                    _extra = f" reason={ef.reason} err={ef.error}"
+                    if ef.error:
+                        _extra += f" ({M.error_string(lib, ef.error)})"
+                log.debug("mpv lifecycle event %d%s", eid, _extra)
             if eid == M.MPV_EVENT_SHUTDOWN:
                 break
             elif eid == M.MPV_EVENT_PROPERTY_CHANGE:
@@ -223,10 +245,11 @@ class MpvCore:
                 self._data_event.set()
             elif eid == M.MPV_EVENT_COMMAND_REPLY:
                 uid = ev.contents.reply_userdata
-                self._cmd_refs.pop(uid, None)
-                if ev.contents.error < 0:
-                    log.debug("command reply %s error %s", uid,
-                              M.error_string(lib, ev.contents.error))
+                ref = self._cmd_refs.pop(uid, None)
+                log.debug("command reply %s (%s) error %s", uid,
+                          " ".join(str(a) for a in ref[1])
+                          if ref else "?",
+                          M.error_string(lib, ev.contents.error))
             elif eid == M.MPV_EVENT_SET_PROPERTY_REPLY:
                 if ev.contents.error < 0:
                     log.debug("set-property reply error %s",

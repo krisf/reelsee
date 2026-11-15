@@ -8,16 +8,23 @@ the capture does not depend on it).
 
 Phase 2 (process B, fresh process, same state dir): the relaunch
 restores size AND position within ±2 px (§A.3); a SECOND window opens
-at the source's EXACT size with x shifted by exactly the configured
-offset (§B.2, ±2 px) and overlapping; move it to the right edge and the
-THIRD window flips to the left (§B.2 chained, flip-at-edge); sizes stay
-identical all the way.
+at the source's EXACT size moved 15 px TOWARD THE SCREEN CENTRE on BOTH
+axes (R20 §0.2 — the user replaced the old right-then-left flip; ±2 px)
+and overlapping; move it to the right edge and the THIRD window steps
+back toward the centre (chained, still centerward); sizes stay identical
+all the way.
 
 Phase 3 (process C, fresh state dir, no-xid simulation): with the
 surface deliberately non-X11 (a stand-in for a Wayland toplevel), the
 whole open path still completes at the correct cascade SIZE, applies
 position as a no-op with exactly ONE debug log, no exception, no retry
 storm (§B.3 — "degrade, never fail").
+
+Phase 4 (process D, fresh state dir, a simulated 60 px bottom PANEL):
+the R20 §0.1 corner rule over real windows.  A rect closed with its
+bottom corners UNDER THE PANEL (2 corners off the work area, 0 off the
+screen) reopens at the EXACT coords+dims — no clamp; a rect with >=2
+corners off the SCREEN still repositions via clamp_into_workarea.
 """
 import json
 import os
@@ -25,6 +32,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 from smoke_harness import SCRATCH, check, finish  # noqa: E402
@@ -40,9 +48,18 @@ os.environ["REELSEE_STATE_DIR"] = str(STATE_DIR)
 
 PHASE = os.environ.get("REELSEE_R10WG_PHASE", "1")
 GEOM_FILE = STATE_DIR / "window.json"
-OFFSET = 50
+# R20 §0.2: the cascade step is 15 px TOWARD THE SCREEN CENTRE now (the
+# user replaced the old 50 px right-then-left flip).  config default too.
+OFFSET = 15
 T1 = (140, 90, 760, 430)          # phase-1 target rect (x, y, w, h)
 TOL = 2
+PANEL_H = 60                     # phase 4: simulated bottom panel height
+# closed with BOTH bottom corners under the panel: 2 corners off the WORK
+# area, 0 off the SCREEN ⇒ must reopen verbatim (R20 §0.1).  Its bottom
+# edge (975) is inside the 1000 px screen but below the 940 px work area.
+PANEL_RECT = (140, 545, 760, 430)
+# 2 corners off the SCREEN (right edge 2260 > 1600) ⇒ reposition as before
+OFFSCREEN_RECT = (1500, 100, 760, 430)
 
 import reelsee  # noqa: E402
 
@@ -145,8 +162,25 @@ def base_schedule(app, phase, shared=None):
         check("p2_size_exact", r0 is not None       # whole feature reads
               and all(abs(a - b) <= TOL for a, b in
                       zip(r0[2:], T1[2:])), str(r0))
+        # R21: the restore is not "send one move and hope" — the settle loop
+        # re-asserts the post-map move until the window is OBSERVED at the
+        # target.  Under a WM-less Xvfb the first move lands, so it must
+        # report a real outcome, a bounded number of moves, and leave
+        # nothing armed before the next window opens.
+        w0 = win()
+        check("p2_settle_reason",
+              getattr(w0, "_geom_settle_reason", None) == "settled",
+              str(getattr(w0, "_geom_settle_reason", None)))
+        check("p2_settle_bounded",
+              1 <= getattr(w0, "_geom_settle_moves", 0) <= 8,
+              str(getattr(w0, "_geom_settle_moves", None)))
+        check("p2_settle_over",
+              getattr(w0, "_geom_settle", None) is None,
+              "the loop finished before the next window opened")
         app._spawn_window()
-        want2 = (T1[0] + OFFSET, T1[1], T1[2], T1[3])
+        # R20 §0.2: 15 px toward the work-area centre on BOTH axes (T1 sits
+        # left of and above the centre, so both deltas are +).
+        want2 = (T1[0] + OFFSET, T1[1] + OFFSET, T1[2], T1[3])
         return wait_for("p2_cascade_pos", lambda: near(rect(1), want2),
                         guard(p2_cascade_checks), see=lambda: rect(1))
 
@@ -154,11 +188,14 @@ def base_schedule(app, phase, shared=None):
         r0, r1 = rect(), rect(1)
         check("p2_two_same_size", r0 is not None and r1 is not None
               and r0[2:] == r1[2:], f"{r0} {r1}")
-        dx = abs(r1[0] - r0[0])
-        check("p2_offset_exact", abs(dx - OFFSET) <= TOL, f"dx={dx}")
+        dx, dy = r1[0] - r0[0], r1[1] - r0[1]
+        check("p2_offset_exact", abs(abs(dx) - OFFSET) <= TOL, f"dx={dx}")
+        check("p2_centerward_y", abs(abs(dy) - OFFSET) <= TOL, f"dy={dy}")
+        # the step goes TOWARD the centre, never away from it (§0.2)
+        check("p2_centerward_sign", dx > 0 and dy > 0, f"dx={dx} dy={dy}")
         check("p2_overlap", wingeom.overlaps(r0, r1), f"{r0} {r1}")
-        # chain + flip: move the NEWEST window to the right edge of the
-        # work area, the next one must flip left (§B.2)
+        # chain + centre: move the NEWEST window to the right edge of the
+        # work area, the next one steps BACK toward the centre (§0.2)
         x11pos.set_rect(win(1), right_edge_rect())
         return wait_for("p2_at_right_edge",
                         lambda: near(rect(1), right_edge_rect()),
@@ -167,7 +204,9 @@ def base_schedule(app, phase, shared=None):
     def p2_spawn3():
         app._spawn_window()
         wx, _wy, ww, _wh = wa()
-        want3 = (wx + ww - T1[2] - OFFSET, T1[1], T1[2], T1[3])
+        # source flush against the right edge ⇒ x steps LEFT toward the
+        # centre; its top is still above the centre ⇒ y keeps stepping down
+        want3 = (wx + ww - T1[2] - OFFSET, T1[1] + OFFSET, T1[2], T1[3])
         return wait_for("p2_flips_left", lambda: near(rect(2), want3),
                         guard(p2_final_checks), see=lambda: rect(2))
 
@@ -176,8 +215,9 @@ def base_schedule(app, phase, shared=None):
         check("p2_flip_same_size", r1 is not None and r2 is not None
               and r1[2:] == r2[2:], f"{r1} {r2}")
         check("p2_flip_overlap", wingeom.overlaps(r1, r2), f"{r1} {r2}")
-        dx = abs(r1[0] - r2[0])
-        check("p2_flip_offset", abs(dx - OFFSET) <= TOL, f"dx={dx}")
+        dx = r2[0] - r1[0]
+        check("p2_flip_offset", abs(abs(dx) - OFFSET) <= TOL, f"dx={dx}")
+        check("p2_flip_centerward_sign", dx < 0, f"dx={dx}")
         check("p2_no_aspect_refights",
               all(w._aspect_corrections == 0 for w in app.windows),
               str([w._aspect_corrections for w in app.windows]))
@@ -227,7 +267,60 @@ def base_schedule(app, phase, shared=None):
         app.quit()
         return False
 
-    first = {"1": p1_moved, "2": p2_restored, "3": p3_noxid}[phase]
+    # ------------------------------------------------------------ phase 4
+    def screen_geos():
+        """The FULL monitor geometries — the SCREEN, panel included (the
+        reference the corner rule counts against, R20 §0.1)."""
+        return wingeom.work_areas(
+            [m.get_geometry() for m in win().get_display().get_monitors()])
+
+    def p4_verbatim():
+        # the ONLY window, restored from a rect whose bottom corners sit
+        # UNDER THE PANEL: the exact coords+dims, no clamp (§0.1)
+        return wait_for("p4_verbatim_restore", lambda: near(rect(), PANEL_RECT),
+                        guard(p4_controls), see=rect)
+
+    def p4_controls():
+        # non-vacuity: the rect really does hang off the WORK area (that is
+        # the bug being fixed) while every corner stays ON THE SCREEN
+        check("p4_hangs_off_workarea",
+              wingeom.corners_offscreen(PANEL_RECT, wa()) >= 2,
+              f"{wingeom.corners_offscreen(PANEL_RECT, wa())} of {wa()}")
+        check("p4_corners_on_screen",
+              wingeom.corners_offscreen(PANEL_RECT, screen_geos()) == 0,
+              str(screen_geos()))
+        check("p4_old_rule_would_move_it",
+              wingeom.clamp_into_workarea(PANEL_RECT, wa()) != PANEL_RECT,
+              str(wingeom.clamp_into_workarea(PANEL_RECT, wa())))
+        check("p4_plan_is_verbatim",
+              win().plan_open_geometry(None) == ("restore", PANEL_RECT),
+              str(win().plan_open_geometry(None)))
+        app.geometry_store.remember(OFFSCREEN_RECT, 0)
+        return guard(p4_reposition)()
+
+    def p4_reposition():
+        # >=2 corners off the SCREEN ⇒ the reposition half of the rule still
+        # runs, and it clamps into the WORK area at the exact size
+        plan = win().plan_open_geometry(None)
+        want = wingeom.clamp_into_workarea(OFFSCREEN_RECT, wa())
+        check("p4_two_corners_off_screen",
+              wingeom.corners_offscreen(OFFSCREEN_RECT, screen_geos()) >= 2,
+              str(wingeom.corners_offscreen(OFFSCREEN_RECT, screen_geos())))
+        check("p4_repositions", plan == ("restore", want),
+              f"{plan} want={want}")
+        got = plan[1] if plan else None
+        check("p4_reposition_keeps_size",
+              got is not None and got[2:] == OFFSCREEN_RECT[2:], str(got))
+        wx, wy, ww, wh = wa()
+        check("p4_reposition_onscreen",
+              got is not None and got[0] >= wx and got[1] >= wy
+              and got[0] + got[2] <= wx + ww and got[1] + got[3] <= wy + wh,
+              f"{got} in {wa()}")
+        app.quit()
+        return False
+
+    first = {"1": p1_moved, "2": p2_restored, "3": p3_noxid,
+             "4": p4_verbatim}[phase]
 
     def start(left=40):
         w = None
@@ -288,10 +381,60 @@ def run_noxid_phase() -> int:
     return rc
 
 
+class PanelMonitor:
+    """A monitor with a bottom panel: its WORK area is PANEL_H shorter than
+    its GEOMETRY — the desktop of the operator recipe.  Only the two calls
+    the placement code makes are wrapped; the rest delegates.  GDK's own C
+    side keeps the real monitor list, so the X11 window still maps normally.
+    """
+
+    def __init__(self, real):
+        self._real = real
+
+    def get_workarea(self):
+        r = self._real.get_workarea()
+        return SimpleNamespace(x=r.x, y=r.y, width=r.width,
+                               height=max(1, r.height - PANEL_H))
+
+    def get_geometry(self):
+        g = self._real.get_geometry()
+        return SimpleNamespace(x=g.x, y=g.y, width=g.width, height=g.height)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def run_panel_phase() -> int:
+    """Process D: remember a panel-hung rect, simulate a bottom panel, then
+    open the app for real — the restore must be verbatim (§0.1)."""
+    import config
+    import gi
+    gi.require_version("Gdk", "4.0")
+    from gi.repository import Gdk
+
+    store = config.GeometryStore(GEOM_FILE)
+    store.remember(PANEL_RECT, 0)
+    store.flush()
+    check("p4_seeded", store.last() == PANEL_RECT, str(store.last()))
+
+    real_get_monitors = Gdk.Display.get_monitors
+    Gdk.Display.get_monitors = (
+        lambda self: [PanelMonitor(m) for m in real_get_monitors(self)])
+    try:
+        rc = reelsee.run(["reelsee"],
+                         on_app=lambda a: base_schedule(a, "4"))
+    finally:
+        Gdk.Display.get_monitors = real_get_monitors
+    check("p4_inner_rc", rc == 0, str(rc))
+    return rc
+
+
 def main() -> int:
     if PHASE != "1":
         if PHASE == "3":
             rc = run_noxid_phase()
+        elif PHASE == "4":
+            rc = run_panel_phase()
         else:
             rc = reelsee.run(["reelsee"],
                              on_app=lambda a: base_schedule(a, PHASE))
@@ -312,17 +455,17 @@ def main() -> int:
     check("phase1_rect_on_disk", ok, json.dumps(disk))
     check("phase1_monitor_recorded", disk.get("monitor") == 0,
           str(disk.get("monitor")))
-    # ...then B (restore + cascade + flip) and C (no-xid) as FRESH
-    # processes over the same state dir (C gets its own).
-    for ph in ("2", "3"):
+    # ...then B (restore + cascade + flip), C (no-xid) and D (panel) as FRESH
+    # processes over the same state dir (C and D get their own).
+    for ph in ("2", "3", "4"):
         # THE dirs travel with the child (its own pid would otherwise pick
         # a fresh scratch dir and phase B would have nothing to restore)
         env = dict(os.environ, REELSEE_R10WG_PHASE=ph,
                    REELSEE_R10WG_CFG_DIR=str(CFG_DIR),
                    REELSEE_R10WG_STATE_DIR=str(STATE_DIR))
-        if ph == "3":              # own dirs: no restored rect to confuse
-            env["REELSEE_R10WG_STATE_DIR"] = str(STATE_DIR) + "-p3"
-            env["REELSEE_R10WG_CFG_DIR"] = str(CFG_DIR) + "-p3"
+        if ph in ("3", "4"):   # own dirs: no restored rect to confuse
+            env["REELSEE_R10WG_STATE_DIR"] = str(STATE_DIR) + f"-p{ph}"
+            env["REELSEE_R10WG_CFG_DIR"] = str(CFG_DIR) + f"-p{ph}"
         out = subprocess.run(
             [sys.executable, os.path.abspath(__file__)],
             env=env, capture_output=True, text=True, timeout=280)
@@ -333,8 +476,9 @@ def main() -> int:
               "marker")
     shutil.rmtree(CFG_DIR, ignore_errors=True)
     shutil.rmtree(STATE_DIR, ignore_errors=True)
-    shutil.rmtree(str(CFG_DIR) + "-p3", ignore_errors=True)
-    shutil.rmtree(str(STATE_DIR) + "-p3", ignore_errors=True)
+    for ph in ("3", "4"):
+        shutil.rmtree(str(CFG_DIR) + f"-p{ph}", ignore_errors=True)
+        shutil.rmtree(str(STATE_DIR) + f"-p{ph}", ignore_errors=True)
     finish()
     return 0
 

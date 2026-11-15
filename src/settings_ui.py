@@ -41,6 +41,12 @@ BINDINGS: tuple[dict, ...] = (
     dict(key="playback.resume_min_s", page="playback", kind="scale",
          label="Resume only past (s)", minimum=0, maximum=3600, step=10,
          digits=0),
+    # R26: a remembered position inside the last N fraction of the runtime
+    # is not restored (the file plays from 0).  window.py clamps what is read
+    # to [0, 0.5], so the row cannot be set into "always restart".
+    dict(key="playback.resume_tail_frac", page="playback", kind="scale",
+         label="Restart if less than this fraction remains",
+         minimum=0.0, maximum=0.5, step=0.01, digits=2),
     dict(key="playback.preload_next", page="playback", kind="switch",
          label="Preload next item"),
     dict(key="playback.keep_open", page="playback", kind="switch",
@@ -204,7 +210,18 @@ BINDINGS: tuple[dict, ...] = (
          label="Remember window size and position"),
     dict(key="ui.cascade_offset_px", page="interface", kind="scale",
          label="New-window cascade offset (px, 0 = exactly on top)",
+         subtitle="toward the screen centre",
          minimum=0, maximum=200, step=1, digits=0),
+    # R24: the backend decides whether the remembered POSITION can be
+    # honoured at all (X11 only — GTK 4 has no move API and xdg-shell no
+    # position request).  Read once at boot by backendpin.apply_pin(), so
+    # unlike the rows above this needs a restart; the subtitle says so
+    # instead of pretending live-apply.  An explicit GDK_BACKEND /
+    # REELSEE_BACKEND_PIN in the environment still beats it.
+    dict(key="ui.x11_backend", page="interface", kind="combo",
+         label="Display backend (positioning needs X11)",
+         subtitle="takes effect on next launch",
+         choices=("auto", "x11", "wayland")),
     dict(key="ui.title_format", page="interface", kind="entry",
          label="Window title (${media-title} placeholder)"),
     dict(key="ui.screenshot_clipboard", page="interface", kind="switch",
@@ -458,6 +475,11 @@ class SettingsWindow:
             return
         else:
             raise ValueError(kind)
+        # R20 §A2: an optional one-line subtitle on the row (every Adw row
+        # kind here inherits Adw.ActionRow.set_subtitle).
+        sub = b.get("subtitle")
+        if sub and hasattr(row, "set_subtitle"):
+            row.set_subtitle(sub)
         self.widgets[key] = row
         group.add(row)
 
