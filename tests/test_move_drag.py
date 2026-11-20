@@ -48,6 +48,10 @@ class _Win:
     nothing but the pending map and a recordable _begin_move."""
 
     _closing = False
+    # R29 stub audit: the REAL _on_move_drag_begin now reads
+    # self._geom_settle first (it aborts a live placement loop the instant
+    # the handle is touched).  This stand-in has no loop ⇒ None.
+    _geom_settle = None
 
     def __init__(self, threshold=8.0):
         self._move_pending = {}

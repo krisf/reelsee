@@ -1222,7 +1222,8 @@ class ReelseeWindow(Gtk.ApplicationWindow):
 
     # -------------------------------- R17-C: app-owned window move --
     def _on_move_drag_begin(self, gesture, start_x, start_y, which) -> None:
-        """NOTHING happens here but recording the origin.
+        """Record the press origin — and (R29) yield any live placement
+        loop the instant the handle is touched.
 
         `Gtk.GestureDrag::drag-begin` is emitted on the PRESS, not when the
         pointer has travelled (measured on this GTK 4.22.4 build: a plain
@@ -1234,6 +1235,17 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         """
         if self._closing:
             return
+        if self._geom_settle is not None:
+            # R29 (D2): the user touching a move handle is the signal —
+            # abort a live placement loop HERE, before the threshold, via
+            # the existing finish (disarms the timer, adopts the observed
+            # rect).  Until the loop yields, its 150 ms re-issued X moves
+            # land INSIDE the user's WM move grab: that is the measured
+            # "title bar not draggable for a couple seconds" after open and
+            # after fullscreen->windowed (both arm the loop).  A plain
+            # press that never travels aborts too — a placement loop must
+            # never outrace a human.
+            self._geom_settle_finish("user-drag", self._geom_live_rect())
         self._move_pending[which] = {
             "x": float(start_x),
             "y": float(start_y),
@@ -1285,6 +1297,12 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         """
         if self._closing:
             return
+        if self._geom_settle is not None:
+            # R29 (D2) second seam: a move started by ANY path (threshold
+            # crossing here without a drag-begin we saw, a11y, tests) must
+            # never race a live placement loop — same two lines as
+            # _on_move_drag_begin, before anything can refuse the move.
+            self._geom_settle_finish("user-drag", self._geom_live_rect())
         top = self.get_surface()
         if top is None or not isinstance(top, Gdk.Toplevel):
             return

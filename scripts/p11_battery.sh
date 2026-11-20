@@ -247,6 +247,24 @@ run hintsbits 90 smoke_hintsbits_r28.py
 # only once the size is honest again.  Negative control: against HEAD's
 # src the same script fails both "never publish" checks (verified).
 run hintgate 180 smoke_hintgate_r28.py
+# R29 D1: a pointer RESTING in the bottom 80 px hover band must lose the
+# chrome (and the cursor) at the idle timeout — hover only holds while the
+# countdown runs.  Out-of-process, own Xvfb :98, real 1280x800 window in
+# fullscreen AND windowed: XTEST park in the band, Xlib GetImage pixel
+# witnesses (bar band bright while shown, uniformly dark after expiry,
+# sustained), motion-in-band re-reveal, bracketed-name + app-log witnesses
+# that the app is really where the assertions claim.  Pre-fix RED:
+# scratch/r29/red_hover_idle_pre_fix.txt (fs/win hidden-in-band rows FAIL).
+run hover_idle 240 smoke_hover_idle_r29.py
+# R29 D2: the R21 settle loop must yield the instant the user touches a
+# move handle.  In-process on the REAL window methods + a real GLib loop
+# behind a WM that IGNORES every move (the loop provably stays armed, so
+# any stop is ours): drag-begin aborts with reason "user-drag" and issues
+# ZERO further set_rect even when pumped past the budget; the press alone
+# aborts; the _begin_move seam aborts before any refusal path; user-grab,
+# close-guard and threshold-crossing move paths asserted unharmed; plus a
+# real-Xvfb cursor leg.  Pre-fix RED: scratch/r29/red_drag_settle_pre_fix.txt.
+run drag_settle 120 smoke_drag_settle_r29.py
 ln -sfn "$RUN_ID" scratch/smoke/latest 2>/dev/null || true
 echo "BATTERY_SUMMARY fails=$fails logs=scratch/smoke/$RUN_ID"
 [ "$fails" -eq 0 ]

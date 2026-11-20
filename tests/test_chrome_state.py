@@ -1,7 +1,9 @@
 """ChromeState state machine (§4.6) — pure, injected clock, 18 cases.
 
 Gate coverage (PLAN §8 P3): idle→hidden, motion→visible+re-arm, pause→visible
-and stays, keyboard does not re-arm, bottom-hover keeps visible.
+and stays, keyboard does not re-arm, bottom-hover keeps visible only while
+the idle countdown runs (R29: idle expiry wins over hover — see
+tests/test_hover_idle_r29.py for the operator-verified truth table).
 
 R13 clock-discontinuity contract (replaces the old "dt > timeout *
 JUMP_FACTOR force-shows a clock-jump"): a discontinuity is measured from
@@ -106,22 +108,34 @@ class TestChromeState(unittest.TestCase):
         st.on_key(5100.0)
         self.assertFalse(st.visible)                  # keyboard keeps it hidden
 
-    def test_bottom_hover_keeps_visible(self):
+    def test_bottom_hover_keeps_visible_until_expiry(self):
+        # R29 (D1): travelling INTO the band reveals and re-arms; a pointer
+        # RESTING there loses the chrome at the timeout — idle expiry now
+        # wins over hover.  This test used to assert (True, "hover") at
+        # tick(2000) AND tick(50000): a stationary pointer in the band
+        # pinning the chrome forever — the D1 defect (operator measured
+        # `DIAGCHROME vis=True reason=hover playing=True hover=True
+        # idle_ms=13822 fs=True`).  50000 was also a
+        # 48 s tick GAP (R13 re-arm), which masked the assertion.  The full
+        # operator-verified 8-row truth table: tests/test_hover_idle_r29.py.
         st = fresh()
         st.on_pointer_motion(0.0)
         st.set_bottom_hover(True, 500.0)
-        for t in (2000.0, 50000.0):
-            self.assertEqual(st.tick(t), (True, "hover"))
+        self.assertEqual(st.tick(2000.0), (True, "hover"))   # 1500ms in band
+        self.assertEqual(st.tick(3499.0), (True, "hover"))   # 2999ms in band
+        self.assertEqual(st.tick(3500.0), (False, "idle"))   # expires IN band
 
     def test_hover_end_resumes_countdown_from_end(self):
+        # R29 (D1) contract: hover holds only while the countdown runs,
+        # and LEAVING re-arms a fresh 3000 ms from the release instant.
         st = fresh()
         st.set_bottom_hover(True, 1000.0)
-        for _t, vis, _r in stream(st, 9000.0, 9990.0):
+        for _t, vis, _r in stream(st, 1010.0, 3990.0):
             self.assertTrue(vis)                      # still visible: hover
-        st.set_bottom_hover(False, 10000.0)
-        self.assertEqual(st.tick(11500.0)[0], True)   # 1510ms ticks: healthy
-        self.assertEqual(st.tick(12999.0)[0], True)   # countdown from end
-        self.assertEqual(st.tick(13001.0)[0], False)  # 3000ms after hover-end
+        st.set_bottom_hover(False, 3995.0)            # leave while visible
+        self.assertEqual(st.tick(5499.0)[0], True)    # gap < TICK_GAP_MAX,
+        self.assertEqual(st.tick(6994.0)[0], True)    # 2999ms after LEAVE
+        self.assertEqual(st.tick(6995.0)[0], False)   # 3000ms after hover-end
 
     # ------------------------------------------------- R13 discontinuities
     def test_stall_while_visible_rearms_countdown(self):

@@ -5,7 +5,9 @@ tests/test_chrome_state.py):
   * hidden ONLY while playing — pause/stop/EOF always shows;
   * 3000 ms of pointer inactivity hides;
   * any pointer motion / click / wheel shows and RE-ARMS;
-  * hovering the bottom 80 px keeps it visible;
+  * hovering the bottom 80 px keeps it visible WHILE the idle countdown is
+    still running (R29: entering the band reveals and re-arms; a pointer
+    RESTING there does not pin the chrome — idle expiry wins over hover);
   * a keyboard never re-arms the timer (keyboard seek while hidden shows a
     1200 ms transient OSD — time + speed — without revealing the bars);
   * a TICK-GAP discontinuity (the gap between two successive tick() calls
@@ -237,13 +239,21 @@ class ChromeState:
                 self._last_motion_ms = t   # discontinuity: re-arm, keep
         if not self.playing:
             self._show("not-playing")
+        elif t - self._last_motion_ms >= self.timeout_ms:
+            # R29 (D1): idle expiry is tested FIRST and WINS over hover.
+            # The old `elif self.bottom_hover: _show("hover")` branch sat
+            # above this test and short-circuited it, so a pointer RESTING
+            # in the bottom 80 px band — exactly where the cursor parks in
+            # fullscreen — pinned the chrome (and downstream the cursor,
+            # which is blanked only on the hide edge) visible forever.
+            # Hover REVEALS on the edge INTO the band and holds the chrome
+            # only while the countdown is still running; it was never meant
+            # to hold it open while nothing moves.
+            self.visible = False
+            self.reason = "idle"
         elif self.bottom_hover:
             self._show("hover")
-        else:
-            if t - self._last_motion_ms >= self.timeout_ms:
-                self.visible = False
-                self.reason = "idle"
-            # else: state unchanged
+        # else: state unchanged
         return self.visible, self.reason
 
 
