@@ -299,13 +299,22 @@ class ChromeState:
     def _rearm(self, t: float) -> None:
         """Restart the idle countdown from the jump instant — R13: a
         discontinuity re-arms but NEVER reveals, so this touches no
-        visibility.  A forgiven (non-chronic) re-arm while visible also
-        re-bases the D1 ceiling: R13 promises such a jump a full fresh
-        timeout, and the backstop must not veto what R13 guarantees
-        (see the __init__ note)."""
+        visibility.
+
+        R31: it must NOT re-base the D1 ceiling either.  R30 re-based
+        `_visible_since_ms` here on the theory that R13 promises a jump a
+        "full fresh timeout", and that handed a PERIODICALLY stalling loop
+        an unlimited supply of fresh ceilings: one isolated big gap is
+        forgiven by D2, the next healthy tick resets the streak, and the
+        stall that follows is forgiven again — forever.  Measured on the
+        shipped 0.2.14 state machine: alternating 4000/100 ms ticks stayed
+        visible for 164 s with the cursor still, and a 2500/500 ms loop for
+        120 s.  The ceiling exists to be the one thing no re-arm can
+        outrun, so it is anchored on GENUINE input edges only; R13's fresh
+        timeout still applies to the IDLE countdown above, which this
+        method does re-arm.
+        """
         self._last_motion_ms = t
-        if self.visible and self._visible_since_ms is not None:
-            self._visible_since_ms = t
 
     def tick(self, now_ms=None):
         """Returns (visible, reason).

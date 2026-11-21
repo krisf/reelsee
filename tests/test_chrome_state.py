@@ -154,13 +154,26 @@ class TestChromeState(unittest.TestCase):
         # a genuine single-tick 30 s gap while VISIBLE re-arms from the
         # jump instant WITHOUT changing visibility or reason — the old
         # contract forced a (True, "clock-jump") reveal.
+        #
+        # R31: the re-arm re-arms the IDLE countdown only.  It must not
+        # re-base the D1 ceiling (it did in 0.2.14, which let a PERIODIC
+        # staller pin the chrome indefinitely — measured 164 s).  Both
+        # halves are asserted: the fresh countdown lands first when it is
+        # inside the ceiling window, and the ceiling is the final word
+        # when it is not.
         st = fresh()
         st.on_pointer_motion(0.0)
         self.assertEqual(st.tick(10.0), (True, "motion"))   # healthy tick
-        self.assertEqual(st.tick(30010.0), (True, "motion"))  # 30 s stall
-        for t, vis, _r in stream(st, 30020.0, 33000.0):
-            self.assertTrue(vis, f"t={t}")            # full countdown left
-        self.assertEqual(st.tick(33010.0)[0], False)  # 3000ms after STALL
+        # (a) a stall early enough that the fresh countdown still wins
+        self.assertEqual(st.tick(2100.0), (True, "motion"))  # 2090 ms stall
+        self.assertEqual(st._last_motion_ms, 2100.0)         # re-armed
+        self.assertEqual(st.tick(5100.0), (False, "idle"))   # 3000 after STALL
+        # (b) a 30 s stall cannot outrun the ceiling (last genuine edge = 0)
+        st = fresh()
+        st.on_pointer_motion(0.0)
+        self.assertEqual(st.tick(10.0), (True, "motion"))
+        self.assertEqual(st.tick(30010.0), (False, "ceiling"))
+        self.assertEqual(st._last_motion_ms, 30010.0)        # re-arm happened
 
     def test_stall_while_hidden_stays_hidden(self):
         # THE R13 REGRESSION: plain idleness crossed the old

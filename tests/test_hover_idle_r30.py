@@ -12,13 +12,15 @@ Round 30 closes the CLASS (references/ROUND30-BRIEF.md):
 
   D1  a hard retraction CEILING: while playing and no menu is genuinely
       open, the chrome cannot stay visible more than 2 x timeout without a
-      GENUINE input edge.  The anchor (_visible_since_ms) re-bases on real
-      input (motion/click/leave/play-resume edges — menu-close and
-      fullscreen route through motion), on a hidden->visible reveal, and —
-      the brief-internal tension, documented in chrome.py — on the FORGIVEN
-      (streak==1) discontinuity re-arm, which the UNCHANGED R13 tests
-      require to keep a full countdown.  Unforgiven re-arms (streak >= 2)
-      never extend it.  Hide reason: "ceiling" (a NEW, distinct string).
+      GENUINE input edge.  The anchor (_visible_since_ms) re-bases ONLY on
+      real input (motion/click/leave/play-resume edges — menu-close and
+      fullscreen route through motion) and on a hidden->visible reveal.
+      R31: it must NOT re-base on a discontinuity re-arm.  R30 did, to keep
+      R13's "full fresh timeout" promise, and that handed a PERIODICALLY
+      stalling loop unlimited fresh ceilings (measured on the shipped
+      0.2.14: pinned for 164 s with the pointer still — the user's second
+      report).  R13's fresh timeout still applies to the IDLE countdown.
+      Hide reason: "ceiling" (a NEW, distinct string).
   D2  the discontinuity streak rule: gap > TICK_GAP_MAX_MS forgives ONE
       isolated stall, chronic stalling does NOT re-arm (gap = real idle).
   D3  the popover hold self-heals through an optional predicate
@@ -97,17 +99,23 @@ class TestChronicDiscontinuities(unittest.TestCase):
     def test_healthy_gaps_reset_the_streak(self):
         # The streak counts CONSECUTIVE big gaps (brief D2: "a normal gap
         # resets the streak"); the rule must not fire across healthy ticks.
+        # R31: assert the RULE (the streak counter) rather than
+        # un-hideability.  0.2.14 re-based the ceiling on every forgiven
+        # stall, so this sequence pinned the chrome forever (measured: 164 s
+        # of alternating 4000/100 ms ticks with the cursor still) — the old
+        # `assertTrue(st.visible)` here encoded exactly that bug.
         self.assertGreater(TICK_GAP_MAX_MS, 2000.0 - 1e-9)
         st = fixed()
         st.on_pointer_motion(0.0)
         st.tick(100.0)                                # baseline tick
         st.tick(4100.0)                               # streak 1 (forgiven)
+        self.assertEqual(st._gap_streak, 1)
         st.tick(4200.0)                               # healthy -> streak 0
+        self.assertEqual(st._gap_streak, 0)
         st.tick(8200.0)                               # streak 1 again
-        self.assertTrue(st.visible)                   # second isolated stall
-        for t in (8300.0, 10100.0):                   # isolated: last big gap
-            st.tick(t)                                #   1900ms of idle left
-        self.assertTrue(st.visible)
+        self.assertEqual(st._gap_streak, 1)
+        self.assertFalse(st.visible)                  # R31: the ceiling is
+        self.assertEqual(st.reason, "ceiling")        #     the final word
 
 
 class TestBandFlapping(unittest.TestCase):
@@ -229,13 +237,25 @@ class NegativeControls(unittest.TestCase):
     reveals immediately (also in TestBandFlapping above)."""
 
     def test_isolated_stall_visible_three_seconds_then_hides(self):
+        # An isolated stall still re-arms the IDLE countdown, but R31: with
+        # the stall past the midpoint of the ceiling window, the ceiling is
+        # what ends visibility (last genuine edge = 0 -> ceiling at 6000).
         st = fixed()
         st.on_pointer_motion(0.0)
         st.tick(500.0)
         self.assertEqual(st.tick(4500.0)[0], True)    # ONE 4000ms stall re-arms
-        for t in (5000.0, 6000.0, 7400.0):
-            self.assertEqual(st.tick(t)[0], True, f"t={t}")   # ~3 s past resume
-        self.assertEqual(st.tick(7500.0), (False, "idle"))    # then hides
+        self.assertEqual(st.tick(5000.0)[0], True)    # countdown still running
+        self.assertEqual(st.tick(6000.0), (False, "ceiling"))  # backstop lands
+        # Negative control for the OTHER half: a stall that leaves the fresh
+        # countdown inside the window ends with the countdown, not the ceiling.
+        # (A 2500 ms gap at t=3000 re-arms to a deadline of 6000, which lands
+        # on or before the ceiling -- and the idle test is evaluated first.)
+        st = fixed()
+        st.on_pointer_motion(0.0)
+        st.tick(500.0)
+        self.assertEqual(st.tick(3000.0)[0], True)    # 2500ms stall re-arms
+        self.assertEqual(st._last_motion_ms, 3000.0)  # re-armed
+        self.assertEqual(st.tick(6000.0), (False, "idle"))     # fresh countdown
 
     def test_paused_survives_the_ceiling(self):
         st = fixed()
@@ -256,3 +276,74 @@ class NegativeControls(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPeriodicStalls(unittest.TestCase):
+    """R31 GATE: a loop that stalls REPEATEDLY but not CONSECUTIVELY.
+
+    0.2.14 forgave every ISOLATED big gap (streak == 1) and re-based the D1
+    ceiling on it; one healthy tick between stalls resets the streak, so a
+    periodically stalling loop was forgiven forever — chrome and cursor
+    pinned with the pointer still.  That is the user's second report, on
+    0.2.14 (which contained R30's ceiling).  Measured on the shipped state
+    machine: alternating 4000/100 ms ticks stayed visible for 164 s; a
+    2500/500 ms loop for 120 s.
+
+    RED on 0.2.14 (never hides); GREEN once the ceiling is anchored on
+    genuine input edges only and no re-arm can extend it.  The bound is the
+    ceiling PLUS one tick gap: the hide lands on the first tick at or after
+    6000 ms, so a stalling loop can delay detection by at most one gap.
+    """
+
+    SPAN = 180000.0
+
+    def _run(self, pattern):
+        st = fixed()
+        st.on_pointer_motion(0.0)
+        t = 100.0
+        st.tick(t)                  # baseline: the first tick skips gap logic
+        i = 0
+        while t < self.SPAN:
+            t += pattern[i % len(pattern)]
+            i += 1
+            vis, reason = st.tick(t)
+            if not vis:
+                return t, reason
+        return None, None
+
+    def _check(self, pattern, why=""):
+        t, reason = self._run(pattern)
+        self.assertIsNotNone(
+            t, f"pattern {pattern} {why} never hid the chrome (PINNED)")
+        self.assertEqual(reason, "ceiling", f"pattern {pattern} {why}")
+        self.assertLessEqual(t, 6000.0 + max(pattern),
+                             f"pattern {pattern} {why} hid late at {t} ms")
+
+    def test_alternating_stall_ends_hidden(self):
+        self._check([4000.0, 100.0], "alternating")
+
+    def test_stall_with_two_healthy_ticks_ends_hidden(self):
+        self._check([4000.0, 100.0, 100.0])
+
+    def test_stall_with_four_healthy_ticks_ends_hidden(self):
+        self._check([4000.0, 100.0, 100.0, 100.0, 100.0])
+
+    def test_just_over_the_guard_ends_hidden(self):
+        # 2500 ms is only 500 ms past TICK_GAP_MAX_MS: the hardest case for
+        # a consecutiveness rule, because NOTHING here looks like a freeze.
+        self._check([2500.0, 500.0], "just-over-guard")
+
+    def test_healthy_loop_still_hides_by_idle(self):
+        # Negative control: the ordinary path must keep its own reason and
+        # its own deadline -- the ceiling must not take over a healthy loop.
+        st = fixed()
+        st.on_pointer_motion(0.0)
+        t = 100.0
+        while t < 5000.0:
+            t += 100.0
+            vis, reason = st.tick(t)
+            if not vis:
+                break
+        self.assertFalse(st.visible)
+        self.assertEqual(reason, "idle")
+        self.assertEqual(t, 3000.0)
