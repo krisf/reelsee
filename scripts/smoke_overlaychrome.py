@@ -240,7 +240,10 @@ def main() -> int:
 
         def p6_reveal_again():
             w = win()
-            w.chrome.motion(float(w.overlay.get_width()) / 2, 300.0,
+            # R32: the SECOND reveal must move a pixel — an event at the same
+            # position as the previous one is not input (Mutter floods those
+            # in fullscreen, which is the bug this gate's siblings caught).
+            w.chrome.motion(float(w.overlay.get_width()) / 2, 301.0,
                             float(w.overlay.get_width()),
                             float(w.overlay.get_height()))
             return again(lambda: wait_for(

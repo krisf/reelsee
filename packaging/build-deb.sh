@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VER=0.2.15
+VER=0.2.16
 OUT=buildout
 STAGE=$OUT/stage
 

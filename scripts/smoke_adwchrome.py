@@ -246,7 +246,7 @@ def probe_schedule(app):
         check("revealed_strip_decisively_darker", m1 <= 0.6 * m2,
               f"revealed={round(m1, 1)} retracted={round(m2, 1)}")
         check("video_still_playing", m > 8, str(m))
-        w.chrome.motion(400, 300, 960, 540)      # wake seam, as the pointer
+        w.chrome.motion(401, 300, 960, 540)      # wake seam (R32: moves a px)
         return again(s2, 250)
 
     def s2():
@@ -277,7 +277,8 @@ def probe_schedule(app):
             state["idle_tries"] += 1
             return again(s4, 250)              # pause-flip lag tolerated
         check("replaying_retracts_again", retracted(w), str(fades(w)))
-        w.chrome.motion(400, 300, 960, 540)     # user wakes, then opens menu
+        # R32: each wake must move a pixel — identical coords are not input.
+        w.chrome.motion(402, 300, 960, 540)     # user wakes, then opens menu
         return again(s5, 150)
 
     def s5():

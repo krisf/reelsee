@@ -153,7 +153,9 @@ def probe_schedule(app):
             return orig(visible, *a, **kw)
 
         w._apply_reveal = spy
-        w.chrome.motion(400, 300, 960, 540)
+        # R32: the wake must MOVE a pixel — an event at the same position as
+        # the previous one is not input, so this used to be a no-op.
+        w.chrome.motion(401, 300, 960, 540)
         armed = w.tick_interval_ms            # still inside the motion call
 
         def after():

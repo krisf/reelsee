@@ -216,6 +216,8 @@ class ChromeState:
         # future show()-without-input path are NOT edges and cannot
         # extend it.
         self._visible_since_ms: float | None = self.clock()
+        # R32: last pointer position reported by a motion event.
+        self._last_pointer_pos = None
         self.visible = True
         self.reason = "start"
 
@@ -230,8 +232,28 @@ class ChromeState:
         self._last_motion_ms = t
         self._visible_since_ms = t
 
-    def on_pointer_motion(self, now_ms=None) -> None:
+    def on_pointer_motion(self, now_ms=None, pos=None) -> None:
+        """A pointer event arrived.  ``pos`` is the (x, y) it reported, when
+        the caller has coordinates.
+
+        R32: a motion event whose coordinates did NOT change is not user
+        input and must not extend the countdown.  In FULLSCREEN, XWayland
+        re-delivers motion continuously with identical coordinates
+        (measured on the user's desktop: ~9-15 events/s at a constant
+        (1477.0, 801.5) while the pointer never moved), so every event
+        re-armed the idle deadline and the chrome — and the cursor, which
+        is blanked only on the hide edge — stayed up forever.  That is the
+        bug R29, R30 and R31 all failed to fix, because each of them fixed
+        the DECISION logic while the input seam kept feeding it fake edges.
+        Identical coordinates are the whole test: a real move of one pixel
+        changes them, and any genuine re-entry has different coordinates
+        from the previous event.
+        """
         t = self._t(now_ms)
+        if pos is not None:
+            if pos == self._last_pointer_pos:
+                return
+            self._last_pointer_pos = pos
         self._edge(t)
         self._show("motion", t)
 
@@ -244,6 +266,9 @@ class ChromeState:
         # leaving re-arms the countdown ONE last time, drops hover state
         # (R30: a window-leave is a genuine edge, so it resets the ceiling
         # too — it is an event, not a re-arm loop)
+        # R32: forget the remembered position — re-entering the window at
+        # the SAME pixel as last time is real input and must reveal.
+        self._last_pointer_pos = None
         self._edge(self._t(now_ms))
         self.bottom_hover = False
 
@@ -761,7 +786,9 @@ class Chrome:
     def motion(self, x: float, y: float, width: float, height: float) -> None:
         self._activity()
         now = self.state.clock()
-        self.state.on_pointer_motion(now)
+        # R32: pass the coordinates so a repeated event for a STILL pointer
+        # cannot re-arm the countdown (XWayland floods fullscreen with them).
+        self.state.on_pointer_motion(now, pos=(x, y))
         self.state.set_bottom_hover(height - y <= BOTTOM_HOVER_PX, now)
 
     def click(self) -> None:

@@ -127,7 +127,10 @@ def probe_schedule(app):
               f"op={ob:.2f}/{ot:.2f} target={tgt[0]}/{tgt[1]} "
               f"alloc={alloc[0]}x{alloc[1]}", flush=True)
         if i == MOTION_S:
-            w.chrome.motion(400, 300, 960, 540)   # POSITIVE CONTROL
+            # R32: the control must MOVE a pixel -- an event at the same
+            # position as the previous one is not input (Mutter floods those
+            # in fullscreen; that flood is the bug this suite missed).
+            w.chrome.motion(401, 300, 960, 540)   # POSITIVE CONTROL
         if i < N_SAMPLES - 1:
             GLib.timeout_add(SAMPLE_REAL_MS, sample, i + 1)
             return False

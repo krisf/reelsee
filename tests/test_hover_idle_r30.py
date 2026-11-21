@@ -347,3 +347,81 @@ class TestPeriodicStalls(unittest.TestCase):
         self.assertFalse(st.visible)
         self.assertEqual(reason, "idle")
         self.assertEqual(t, 3000.0)
+
+
+class TestStillPointerFlood(unittest.TestCase):
+    """R32 GATE: a motion event at UNCHANGED coordinates is not input.
+
+    Measured on the user's desktop with the instrumented build: in
+    FULLSCREEN, XWayland re-delivers motion events continuously (~9-15/s)
+    with the pointer physically still, and every one carried the identical
+    position (1477.0, 801.5).  Each event called on_pointer_motion(), which
+    re-armed the idle deadline — so the chrome and the cursor never
+    retracted, and no backstop could help because the ceiling's anchor is
+    only moved by what it believes are genuine input edges.  Windowed, the
+    same session logged ZERO such events, which is why every Xvfb gate
+    (free of Mutter/XWayland) stayed green through three rounds of this.
+
+    RED on 0.2.15 (never hides under the flood); GREEN once a degenerate
+    event is dropped at the input seam.  The moving-pointer and wake()
+    controls must keep passing: this must not deaden real input.
+    """
+
+    def test_still_pointer_flood_ends_hidden(self):
+        st = fixed()
+        st.on_pointer_motion(0.0, pos=(1477.0, 801.5))
+        t = 100.0
+        while t <= 10000.0:
+            st.on_pointer_motion(t, pos=(1477.0, 801.5))   # same coords
+            st.tick(t)                                     # the app also ticks
+            t += 100.0
+        self.assertFalse(st.visible, "a still-pointer flood pinned the chrome")
+        self.assertEqual(st.reason, "idle")
+
+    def test_hidden_by_the_idle_deadline_not_late(self):
+        st = fixed()
+        st.on_pointer_motion(0.0, pos=(10.0, 10.0))
+        t = 0.0
+        while t < 5000.0:
+            t += 100.0
+            st.on_pointer_motion(t, pos=(10.0, 10.0))
+            st.tick(t)
+            if not st.visible:
+                break
+        self.assertFalse(st.visible)
+        self.assertEqual(t, 3000.0)      # exactly the timeout, no drift
+
+    def test_moving_pointer_still_rearms(self):
+        # Negative control: REAL motion must keep the chrome up, or this
+        # fix would deaden the player.
+        st = fixed()
+        st.on_pointer_motion(0.0, pos=(10.0, 10.0))
+        t = 100.0
+        while t <= 2900.0:
+            st.on_pointer_motion(t, pos=(10.0 + t / 100.0, 10.0))
+            st.tick(t)
+            t += 100.0
+        self.assertTrue(st.visible, "real pointer movement stopped re-arming")
+
+    def test_wake_without_coordinates_still_rearms(self):
+        # wake()/menu-close pass no position: they are deliberate edges.
+        st = fixed()
+        st.on_pointer_motion(0.0, pos=(5.0, 5.0))
+        st.tick(2900.0)
+        self.assertTrue(st.visible)
+        st.on_pointer_motion(2900.0)          # pos=None -> a real edge
+        self.assertEqual(st.tick(4000.0)[0], True)   # countdown restarted
+        self.assertEqual(st.tick(5900.0)[0], False)
+
+    def test_note_the_flood_does_not_reset_the_ceiling(self):
+        # Even under a still-pointer flood the backstop anchor must stay
+        # where the last REAL edge put it.
+        st = fixed()
+        st.on_pointer_motion(0.0, pos=(1.0, 2.0))
+        t = 100.0
+        while t <= 7000.0:
+            st.on_pointer_motion(t, pos=(1.0, 2.0))
+            st.tick(t)
+            t += 100.0
+        self.assertFalse(st.visible)
+        self.assertIn(st.reason, ("idle", "ceiling"))

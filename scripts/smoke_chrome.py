@@ -96,7 +96,10 @@ def probe_schedule(app):
         check("osd_transient", c.osd.get_visible(), str(c.osd.get_label()))
         stay = bars_hidden(win())          # assertion result, not raw flag
         check("bars_stay_hidden", stay, str(stay))
-        c.motion(400, 300, 960, 540)       # pointer motion reveals
+        # R32: a REAL move changes the coordinates.  An event at the same
+        # position as the previous one is NOT input — Mutter floods exactly
+        # those in fullscreen, which is what pinned the chrome.
+        c.motion(401, 300, 960, 540)       # pointer motion reveals
         GLib.timeout_add(250, s4)         # 250 > the 180 ms reveal fade
         return False
 
