@@ -6,8 +6,11 @@ tests/test_chrome_state.py):
   * 3000 ms of pointer inactivity hides;
   * any pointer motion / click / wheel shows and RE-ARMS;
   * hovering the bottom 80 px keeps it visible WHILE the idle countdown is
-    still running (R29: entering the band reveals and re-arms; a pointer
-    RESTING there does not pin the chrome — idle expiry wins over hover);
+    still running (R29: entering the band reveals; a pointer RESTING there
+    does not pin the chrome — idle expiry wins over hover.  R30 D4: neither
+    band EDGE touches the countdown — the pointer MOTION that produced the
+    edge re-arms, and Chrome.motion() calls both with the same timestamp;
+    an edge alone must never extend the deadline);
   * a keyboard never re-arms the timer (keyboard seek while hidden shows a
     1200 ms transient OSD — time + speed — without revealing the bars);
   * a TICK-GAP discontinuity (the gap between two successive tick() calls
@@ -17,7 +20,13 @@ tests/test_chrome_state.py):
     chrome that was legitimately shown; it must never resurrect a chrome
     the user already dismissed.  Elapsed idle time is not a jump (R13):
     once hidden, the chrome stays hidden while ticks keep coming —
-    only input shows it again.
+    only input shows it again.  R30 D2: ONE isolated big gap is forgiven;
+    CONSECUTIVE big gaps (streak >= 2) are a stalling main loop, not a
+    freeze — they count as real elapsed idle and do NOT re-arm.
+  * a hard retraction CEILING (R30 D1): while playing, the chrome cannot
+    stay visible more than 2 x timeout_ms without a GENUINE input edge —
+    whatever internal path keeps re-arming the countdown, the chrome and
+    the cursor retract anyway (reason "ceiling").
 GTK side applies visibility as opacity (180 ms CSS transition) + blank cursor.
 """
 from __future__ import annotations
@@ -29,6 +38,10 @@ BOTTOM_HOVER_PX = 80
 TICK_GAP_MAX_MS = 2000.0   # gap between SUCCESSIVE TICKS beyond this (or
                            # negative) is a clock discontinuity: re-arm
                            # countdown, leave visibility untouched (R13)
+CEILING_FACTOR = 2.0       # R30 (D1): visible for more than this MANY
+                           # timeouts since the last GENUINE input edge and
+                           # the chrome force-retracts (reason "ceiling") —
+                           # the backstop no re-arm path can outrun
 REVEAL_FADE_MS = 180.0     # R12: crossfade of the reveal groups — pure
 FADE_TICK_MS = 16          # opacity, allocation untouched
 
@@ -162,7 +175,16 @@ def repeat_props(mode):
 
 
 class ChromeState:
-    """Pure state machine, injected clock (ms) — no GTK, fully unit-tested."""
+    """Pure state machine, injected clock (ms) — no GTK, fully unit-tested.
+
+    R30 invariants (references/ROUND30-BRIEF.md): the chrome must be
+    impossible to PIN as a class.  The countdown is extended by GENUINE
+    input edges only — pointer motion/click, window leave, play/pause,
+    menu close and fullscreen edges (the last two route through motion) —
+    never by a bare hover-edge signal (D4) and never by a CHRONIC tick-gap
+    streak (D2); and D1 puts a hard 2 x timeout ceiling underneath all of
+    it (see tick()).
+    """
 
     def __init__(self, timeout_ms: float = IDLE_MS_DEFAULT, clock=None):
         self.clock = clock or (lambda: time.monotonic() * 1000.0)
@@ -173,6 +195,27 @@ class ChromeState:
         # R13: discontinuity is measured TICK-TO-TICK, never against the
         # last input — None until the first tick establishes a baseline.
         self._last_tick_ms: float | None = None
+        # R30 (D2): consecutive tick gaps beyond TICK_GAP_MAX_MS.  One
+        # isolated big gap is a freeze (forgiven, R13); streak >= 2 is a
+        # main loop that keeps stalling — that is REAL elapsed idle and
+        # must not re-arm (measured pin: gap=4007 every tick, forever).
+        self._gap_streak = 0
+        # R30 (D1): hard retraction ceiling.  Monotonic anchor set on every
+        # hidden→visible transition and on every GENUINE input edge; None
+        # while hidden.  While playing, `visible` may never outlive
+        # CEILING_FACTOR x timeout_ms without a genuine edge — whatever
+        # internal path keeps re-arming the countdown, chrome and cursor
+        # retract anyway (reason "ceiling").  One deliberate exception is
+        # forced by the R13 contract: a FORGIVEN discontinuity re-arm
+        # (gap<0, or the first of a streak) re-bases this anchor while
+        # visible, because R13 guarantees such a jump carries a full fresh
+        # timeout (test_stall_while_visible_rearms_countdown asserts
+        # (True, "motion") 30 s after the visible-since start) — resuming
+        # from a genuine freeze IS an edge.  CHRONIC re-arm pressure
+        # (streak >= 2), bare hover edges, OSD/toast deadlines and any
+        # future show()-without-input path are NOT edges and cannot
+        # extend it.
+        self._visible_since_ms: float | None = self.clock()
         self.visible = True
         self.reason = "start"
 
@@ -180,24 +223,36 @@ class ChromeState:
     def _t(self, now_ms):
         return self.clock() if now_ms is None else float(now_ms)
 
+    def _edge(self, t: float) -> None:
+        """A GENUINE input edge: re-arms the countdown AND resets the D1
+        ceiling anchor (the ceiling measures from the last real input, so
+        real input — and only real input — reopens the budget)."""
+        self._last_motion_ms = t
+        self._visible_since_ms = t
+
     def on_pointer_motion(self, now_ms=None) -> None:
-        self._last_motion_ms = self._t(now_ms)
-        self._show("motion")
+        t = self._t(now_ms)
+        self._edge(t)
+        self._show("motion", t)
 
     def on_pointer_click(self, now_ms=None) -> None:
-        self._last_motion_ms = self._t(now_ms)
-        self._show("click")
+        t = self._t(now_ms)
+        self._edge(t)
+        self._show("click", t)
 
     def on_pointer_leave(self, now_ms=None) -> None:
         # leaving re-arms the countdown ONE last time, drops hover state
-        self._last_motion_ms = self._t(now_ms)
+        # (R30: a window-leave is a genuine edge, so it resets the ceiling
+        # too — it is an event, not a re-arm loop)
+        self._edge(self._t(now_ms))
         self.bottom_hover = False
 
     def on_playing_changed(self, playing: bool, now_ms=None) -> None:
         self.playing = bool(playing)
-        self._last_motion_ms = self._t(now_ms)   # fresh countdown on either edge
+        t = self._t(now_ms)
+        self._edge(t)                          # fresh countdown on either edge
         if not self.playing:
-            self._show("not-playing")
+            self._show("not-playing", t)
 
     def on_key(self, now_ms=None) -> None:
         """Keyboard NEVER re-arms the timer (§4.6) — no-op for the state."""
@@ -206,15 +261,51 @@ class ChromeState:
         inside = bool(inside)
         if inside != self.bottom_hover:
             self.bottom_hover = inside
-            # both edges re-arm: leaving restarts the countdown from release
-            self._last_motion_ms = self._t(now_ms)
+            # R30 (D4): entering the band REVEALS, but NEITHER edge touches
+            # _last_motion_ms.  The old "both edges re-arm" made a pointer
+            # flapping across the band boundary (touchpad jitter, a warped
+            # cursor, a tooltip stealing and returning the pointer) an
+            # indefinitely renewable pin: every 100 ms flap pushed the
+            # deadline out by another full timeout with ZERO motion in the
+            # window.  The countdown is re-armed by the MOTION that
+            # produced the edge — window.py calls Chrome.motion() (which
+            # lands on_pointer_motion AND set_bottom_hover with the same
+            # timestamp) on every real event — so a genuine entry still
+            # gets its full 3 s, and a bare edge signal (synthetic hover
+            # with no motion) gets exactly the reveal and nothing more.
+            # Leaving the band likewise does not restart the countdown: the
+            # timer keeps running from the last real input, which is the
+            # only reading of "hover holds while the countdown runs"
+            # (R29) that cannot be leveraged into a pin.
             if inside:
-                self._show("hover")
+                self._show("hover", self._t(now_ms))
 
     # ---------------------------------------------------------------- output
-    def _show(self, reason: str) -> None:
+    def _show(self, reason: str, at=None) -> None:
+        if not self.visible:
+            # R30 (D1): a hidden→visible transition re-bases the ceiling —
+            # the clock for the backstop restarts the moment the chrome
+            # actually comes back, measured at the transition instant.
+            self._visible_since_ms = self._t(at)
         self.visible = True
         self.reason = reason
+
+    def _hide(self, reason: str) -> None:
+        self.visible = False
+        self.reason = reason
+        self._visible_since_ms = None   # D1: the ceiling applies afresh
+                                        # on the next genuine reveal
+
+    def _rearm(self, t: float) -> None:
+        """Restart the idle countdown from the jump instant — R13: a
+        discontinuity re-arms but NEVER reveals, so this touches no
+        visibility.  A forgiven (non-chronic) re-arm while visible also
+        re-bases the D1 ceiling: R13 promises such a jump a full fresh
+        timeout, and the backstop must not veto what R13 guarantees
+        (see the __init__ note)."""
+        self._last_motion_ms = t
+        if self.visible and self._visible_since_ms is not None:
+            self._visible_since_ms = t
 
     def tick(self, now_ms=None):
         """Returns (visible, reason).
@@ -229,14 +320,31 @@ class ChromeState:
         is untouched, because re-arm exists solely to stop a stall from
         hiding the chrome the instant it resumes.  Once hidden it stays
         hidden while ticks keep coming: only input shows it again.
+
+        R30 (D2): that forgiveness is exactly what a stalling main loop
+        exploits — the measured pin ticks a ~4007 ms gap every tick, and
+        "gap > 2000 → re-arm" hands it a fresh timeout forever, chrome (and
+        cursor) pinned for the rest of the session.  One ISOLATED big gap
+        still reads as a freeze and is forgiven (R13 preserved); the
+        SECOND CONSECUTIVE big gap is not a freeze, it is a loop that keeps
+        stopping, and consecutive stops are real idle: no re-arm.  Any
+        healthy gap resets the streak.
         """
         t = self._t(now_ms)
         prev = self._last_tick_ms
         self._last_tick_ms = t
         if prev is not None:
             gap = t - prev
-            if gap < 0.0 or gap > TICK_GAP_MAX_MS:
-                self._last_motion_ms = t   # discontinuity: re-arm, keep
+            if gap < 0.0:
+                self._gap_streak = 0
+                self._rearm(t)           # backwards clock: a real jump
+            elif gap > TICK_GAP_MAX_MS:
+                self._gap_streak += 1
+                if self._gap_streak == 1:
+                    self._rearm(t)       # ONE isolated stall: forgiven
+                # streak >= 2: chronic stall = real idle, NO re-arm
+            else:
+                self._gap_streak = 0     # a normal gap resets the streak
         if not self.playing:
             self._show("not-playing")
         elif t - self._last_motion_ms >= self.timeout_ms:
@@ -249,10 +357,20 @@ class ChromeState:
             # Hover REVEALS on the edge INTO the band and holds the chrome
             # only while the countdown is still running; it was never meant
             # to hold it open while nothing moves.
-            self.visible = False
-            self.reason = "idle"
+            self._hide("idle")
         elif self.bottom_hover:
-            self._show("hover")
+            self._show("hover", t)
+        # R30 (D1): hard retraction ceiling — the last word.  Runs AFTER
+        # the chain (idle expiry keeps its own reason), only ever HIDES,
+        # never fires while paused, and cannot be extended by anything
+        # that is not a genuine input edge (or a forgiven R13 re-arm).
+        # A popover hold lives one layer up (Chrome.tick), so a genuinely
+        # open menu still wins over the ceiling while it is open; a LEAKED
+        # hold cannot, because D3 heals it back to no hold.
+        if (self.playing and self.visible
+                and self._visible_since_ms is not None
+                and t - self._visible_since_ms >= CEILING_FACTOR * self.timeout_ms):
+            self._hide("ceiling")
         # else: state unchanged
         return self.visible, self.reason
 
@@ -409,6 +527,13 @@ class Chrome:
     """
 
     SPEED_PRESETS = (1.0, 1.25, 1.5, 2.0, 0.5, 0.75)
+    # R30 (D3): optional zero-arg predicate — True iff a popover menu is
+    # ACTUALLY visible right now.  window.py installs
+    # `lambda: any(p.get_visible() for p in self._chrome_pops)`; tick()
+    # self-heals the menu hold against it (see Chrome.tick).  Class
+    # attribute on purpose: a bare/absent installation (unit stubs,
+    # headless harnesses) keeps the pre-R30 pure-counter behaviour.
+    menu_present = None
 
     def __init__(self, window, cfg, on_seek=None, on_volume=None,
                  on_speed=None, on_ab=None, on_repeat=None, on_decode=None,
@@ -727,8 +852,28 @@ class Chrome:
         (bottom bar + top overlay strip) by OPACITY crossfade only — no
         set_child_visible, no allocation change, so the video never
         resizes when chrome appears or retracts.  An open popover holds
-        it revealed (menu must never be stranded by a retracting bar)."""
+        it revealed (menu must never be stranded by a retracting bar).
+
+        R30 (D3): the hold is a COUNTER, and counters leak — the R5-A
+        pair (menu_opened/menu_closed) assumes every open signal is
+        followed by a close signal, and any path that drops one (a menu
+        destroyed while open, a notify reordered around teardown) leaves
+        `_menu_open` permanently non-zero: chrome pinned, cursor stranded,
+        the D1 ceiling held over by the hold itself.  So the counter is
+        SELF-HEALED against the truth every tick: with a menu_present
+        predicate installed (window.py), a non-zero counter with NO
+        popover actually visible is a leak — zero it, the hold dies, and
+        retraction proceeds.  A genuinely open menu still wins: that is
+        the one case the predicate confirms.  Predicate absent (unit
+        stubs, headless builds) keeps the pure-counter behaviour.  The
+        hold can never resurrect from hidden with no input (the state
+        machine stays the only re-show path) and never overrides the
+        not-playing rule while paused with no menu… which it cannot even
+        reach: pause shows the chrome anyway."""
         visible, _reason = self.state.tick()
+        if self._menu_open and self.menu_present is not None \
+                and not self.menu_present():
+            self._menu_open = 0            # leaked hold: heal
         if self._menu_open:
             visible = True
         self._set_chrome_visible(visible)

@@ -120,6 +120,11 @@ class TestChromeState(unittest.TestCase):
         # operator-verified 8-row truth table: tests/test_hover_idle_r29.py.
         st = fresh()
         st.on_pointer_motion(0.0)
+        # R30 (D4): the band EDGE no longer re-arms the countdown — the
+        # pointer MOTION that produced it does (Chrome.motion() calls
+        # on_pointer_motion() and set_bottom_hover() in the same pass with
+        # the same timestamp), so the edge is driven WITH its motion here.
+        st.on_pointer_motion(500.0)
         st.set_bottom_hover(True, 500.0)
         self.assertEqual(st.tick(2000.0), (True, "hover"))   # 1500ms in band
         self.assertEqual(st.tick(3499.0), (True, "hover"))   # 2999ms in band
@@ -127,12 +132,18 @@ class TestChromeState(unittest.TestCase):
 
     def test_hover_end_resumes_countdown_from_end(self):
         # R29 (D1) contract: hover holds only while the countdown runs,
-        # and LEAVING re-arms a fresh 3000 ms from the release instant.
+        # and the countdown continues from the release instant.
+        # R30 (D4): LEAVING no longer re-arms anything itself — in the real
+        # app a leave edge is always the tail of a motion event (Chrome.
+        # motion(): on_pointer_motion + set_bottom_hover, same timestamp),
+        # so the edge is driven with its motion here; the hide still lands
+        # exactly 3000 ms after the release.
         st = fresh()
         st.set_bottom_hover(True, 1000.0)
         for _t, vis, _r in stream(st, 1010.0, 3990.0):
             self.assertTrue(vis)                      # still visible: hover
-        st.set_bottom_hover(False, 3995.0)            # leave while visible
+        st.on_pointer_motion(3995.0)                  # leave while visible
+        st.set_bottom_hover(False, 3995.0)            # (edge + its motion)
         self.assertEqual(st.tick(5499.0)[0], True)    # gap < TICK_GAP_MAX,
         self.assertEqual(st.tick(6994.0)[0], True)    # 2999ms after LEAVE
         self.assertEqual(st.tick(6995.0)[0], False)   # 3000ms after hover-end

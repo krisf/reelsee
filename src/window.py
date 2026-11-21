@@ -720,8 +720,16 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         self.add_controller(keys)
 
         self._build_actions()
+        # R30 (D3): every popover that drives chrome.menu_opened()/
+        # menu_closed() registers here (_popover_of + the context menu) so
+        # the chrome can check the menu HOLD against reality: a leaked
+        # open-counter (a close signal that never fired) would otherwise
+        # pin chrome + cursor forever (Chrome.tick heals it from this).
+        self._chrome_pops: list = []
         self._build_popovers()          # §7 T1: playlist / chapters / tracks
         self._build_context_menu()      # R6-A: right-click menu on video
+        self.chrome.menu_present = lambda: any(
+            p.get_visible() for p in self._chrome_pops)
         # R16-A: THE 100 Hz-FOREVER TICK IS GONE.  One fixed 10 ms source
         # used to drive chrome reveal AND the render/event pump for every
         # window, visible or not, forever; N windows meant N x 100 Hz of
@@ -1017,6 +1025,7 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         # an open menu HOLDS the chrome revealed (same rule as the top
         # popovers, same handler) and re-arms the idle timer on close.
         self._ctx_pop.connect("notify::visible", self._on_popover_visible)
+        self._chrome_pops.append(self._ctx_pop)   # R30 (D3): hold self-heal
 
     def _set_repeat_mode(self, mode: str,
                          action: Gio.SimpleAction | None = None) -> None:
@@ -3368,6 +3377,7 @@ class ReelseeWindow(Gtk.ApplicationWindow):
         # would strand the menu — and the idle timer re-arms when it
         # closes.
         pop.connect("notify::visible", self._on_popover_visible)
+        self._chrome_pops.append(pop)          # R30 (D3): hold self-heal
         return pop
 
     def _on_popover_visible(self, pop, _pspec) -> None:

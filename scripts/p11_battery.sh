@@ -265,6 +265,19 @@ run hover_idle 240 smoke_hover_idle_r29.py
 # close-guard and threshold-crossing move paths asserted unharmed; plus a
 # real-Xvfb cursor leg.  Pre-fix RED: scratch/r29/red_drag_settle_pre_fix.txt.
 run drag_settle 120 smoke_drag_settle_r29.py
+# R30 gates 6-7: retraction under the HiDPI fullscreen surface and under a
+# STALLING main loop.  leg6: the REAL app through reelsee.run in a re-exec
+# of the smoke under GDK_SCALE=2 on an own 2560x1440 Xvfb, XTEST park in
+# the bottom band, held still: chrome dark + a Chrome._blank_cursor (True)
+# edge at the GTK seam within 2*timeout+margin.  Measured GREEN already at
+# 306eae5 — the HiDPI hypothesis did NOT reproduce (see DSH-REPORT-R30.md);
+# kept as coverage.  leg7: in-process, pointer parked, the MAIN LOOP
+# deliberately stalled TWICE (time.sleep(2.5) from a GLib.timeout_add
+# callback — a clock discontinuity): the first stall is forgiven (mid-
+# visible control, R13), the second no longer re-arms, so the honest idle
+# deadline still lands — RED pre-D2 (every gap re-armed, chrome still
+# pinned at the deadline: scratch/r30/red_smoke_pre_fix.txt).
+run hover_idle_r30 240 smoke_hover_idle_r30.py
 ln -sfn "$RUN_ID" scratch/smoke/latest 2>/dev/null || true
 echo "BATTERY_SUMMARY fails=$fails logs=scratch/smoke/$RUN_ID"
 [ "$fails" -eq 0 ]

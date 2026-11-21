@@ -152,14 +152,20 @@ class HoverIdleTruthTable(unittest.TestCase):
 
 
 class HoverStillRevealsAndRearms(unittest.TestCase):
-    """The fix must NOT disable hover: the reveal + re-arm on entering the
-    band stays exactly as it was (brief §D1 'Required fix')."""
+    """The fix must NOT disable hover: the reveal on entering the band
+    stays exactly as it was (brief §D1 'Required fix').  R30 (D4) changed
+    WHERE the re-arm lives: the band EDGE no longer touches the countdown,
+    the pointer MOTION that produced it does — Chrome.motion() calls
+    on_pointer_motion() and set_bottom_hover() in the same pass with the
+    same timestamp, so the edges below are driven with their motion.
+    Every asserted timestamp is unchanged."""
 
     def test_entering_band_reveals_before_the_timeout(self):
         st = fresh()
         st.on_pointer_motion(0.0)
         list(ticks(st, 1000.0, 5000.0))         # hidden, pointer outside band
-        st.set_bottom_hover(True, 5100.0)       # travel INTO the band
+        st.on_pointer_motion(5100.0)            # travel INTO the band
+        st.set_bottom_hover(True, 5100.0)       # (the edge + its motion)
         self.assertEqual((st.visible, st.reason), (True, "hover"))
         self.assertEqual(st.tick(6100.0), (True, "hover"))   # fresh countdown
         self.assertEqual(st.tick(8099.0), (True, "hover"))   # 2999ms after edge
