@@ -601,6 +601,7 @@ class Chrome:
         self._osd_deadline = 0.0
         self._toast_deadline = 0.0
         self._cursor_blank = False
+        self._blank_cursor_obj = None
         self._last_playing = None
         self._bars_visible = True
         # R12: the reveal groups — every widget that fades WITH the bar
@@ -986,20 +987,93 @@ class Chrome:
         self._fade_ids[key] = GLib.timeout_add(FADE_TICK_MS, step)
 
     def _blank_cursor(self, blank: bool) -> None:
+        """Show or hide the mouse pointer.
+
+        R33: this never worked.  GDK4's constructor is
+        ``Gdk.Cursor.new_from_name(name, fallback)``, but the old code passed
+        the DISPLAY as the first argument, so every call raised TypeError and
+        a bare ``except Exception: pass`` swallowed it — the pointer was never
+        blanked, which is exactly what the user saw: the menu retracted and
+        the cursor stayed on the video forever.  Verified on the user's
+        machine: ``Gdk.Cursor.new_from_name("none", None)`` returns a real
+        cursor (GDK synthesises one; no theme file is needed, and this system
+        has no ``none`` cursor on disk).
+
+        The cursor is set on the WIDGET under the pointer as well as on the
+        toplevel surface: fullscreen re-delivers motion events, and GTK
+        re-applies the cursor of the widget the pointer is over, so a
+        surface-only cursor can be undone.
+        """
         if blank == self._cursor_blank:
             return
         self._cursor_blank = blank
-        gw = self.win.get_surface()
-        if gw is None:
+        widgets = list(self._cursor_widgets())
+        if not blank:
+            for w in widgets:
+                w.set_cursor(None)
+            for w in widgets:
+                surf = w.get_surface() if hasattr(w, "get_surface") else None
+                if surf is not None:
+                    surf.set_cursor(None)
             return
-        if blank:
+
+        cur = self._make_blank_cursor()
+        if cur is None:
+            # Loud, not silent: a future GDK change must not turn this back
+            # into an invisible no-op.
+            print("REELSEE: could not create a blank cursor — pointer stays "
+                  "visible", flush=True)
+            self._cursor_blank = False
+            return
+        self._blank_cursor_obj = cur
+        surf = self.win.get_surface()
+        if surf is not None:
+            surf.set_cursor(cur)          # belt and braces
+        for w in widgets:
             try:
-                cur = Gdk.Cursor.new_from_name(self.win.get_display(), "none")
-                gw.set_cursor(cur)
-            except Exception:
-                pass
-        else:
-            gw.set_cursor(None)
+                w.set_cursor(cur)
+            except Exception as e:
+                print(f"REELSEE: set_cursor failed on {w}: {e!r}", flush=True)
+
+    def _cursor_widgets(self):
+        """Widgets the pointer can be over — the video area, the overlay the
+        chrome lives in, and the toplevel."""
+        seen = []
+        for name in ("view", "overlay", "win"):
+            obj = getattr(self, name, None)
+            if obj is None:
+                continue
+            area = getattr(obj, "area", None)      # RenderView's GLArea
+            for cand in (area, obj):
+                if cand is not None and hasattr(cand, "set_cursor") and \
+                        cand not in seen:
+                    seen.append(cand)
+        return seen
+
+    @staticmethod
+    def _make_blank_cursor():
+        """An invisible cursor, with a texture fallback that cannot fail on a
+        theme that lacks ``none``."""
+        try:
+            cur = Gdk.Cursor.new_from_name("none", None)
+            if cur is not None:
+                return cur
+        except Exception as e:
+            print(f"REELSEE: new_from_name('none') failed: {e!r}", flush=True)
+        try:
+            import gi
+            gi.require_version("GdkPixbuf", "2.0")
+            from gi.repository import GdkPixbuf
+            import warnings
+            pb = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, 1, 1)
+            pb.fill(0x00000000)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                tex = Gdk.Texture.new_for_pixbuf(pb)
+            return Gdk.Cursor.new_from_texture(tex, 0, 0, None)
+        except Exception as e:
+            print(f"REELSEE: blank cursor fallback failed: {e!r}", flush=True)
+            return None
 
     # --------------------------------------------------------------- repeat
     def set_repeat(self, mode: str) -> None:

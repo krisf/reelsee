@@ -68,6 +68,7 @@ run adwchrome    120 smoke_adwchrome.py
 run overlaychrome 120 smoke_overlaychrome.py
 run overlaychrome_b 120 smoke_overlaychrome.py
 run overlaychrome_c 120 smoke_overlaychrome.py
+run cursor 130 smoke_cursor.py
 # R13: the idle-stability gate — real window, fast-forwarded clock, ZERO
 # input for 60 simulated seconds: exactly one hide, opacity 0 at every
 # sample after it (the old dt>timeout*4 rule resurrected the chrome on
